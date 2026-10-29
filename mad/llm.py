@@ -1,3 +1,4 @@
+import re
 import requests
 
 
@@ -19,6 +20,14 @@ class LLMClient:
         )
 
         response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
 
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        # Remove model reasoning blocks such as <think>...</think>
+        content = re.sub(
+            r"<think>.*?</think>",
+            "",
+            content,
+            flags=re.DOTALL
+        ).strip()
+
+        return content
