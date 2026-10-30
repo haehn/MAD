@@ -1,3 +1,5 @@
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
 CUDA_VISIBLE_DEVICES=0 \
 vllm serve Qwen/Qwen3.5-27B-GPTQ-Int4 \
   --host 0.0.0.0 \
