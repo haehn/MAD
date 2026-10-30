@@ -30,8 +30,12 @@ def main():
             print(f"  - {item}")
 
     print("\nAGENTS:")
+
     for agent in project.agents:
-        print(f"  - {agent}")
+        print(f"\n{agent.name}")
+        print(f"  description: {agent.description}")
+        print(f"  template:    {agent.template}")
+        print(f"  model:       {agent.model}")
 
 
 if __name__ == "__main__":

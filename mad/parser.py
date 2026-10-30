@@ -1,5 +1,7 @@
 from pathlib import Path
+import re
 
+from mad.agent import Agent
 from mad.project import Project
 
 
@@ -51,7 +53,7 @@ class ProjectParser:
                 success.append(self._list_item(line))
 
             elif section == "agents":
-                agents.append(self._list_item(line))
+                agents.append(self._parse_agent(line))
 
         project = Project(
             objective=" ".join(objective).strip(),
@@ -62,6 +64,35 @@ class ProjectParser:
 
         self._validate(project)
         return project
+
+    @staticmethod
+    def _parse_agent(line):
+        line = line.lstrip("-").strip()
+
+        match = re.match(
+            r"^(.*?)\s*\(([^:]+):(.+)\)\s*$",
+            line
+        )
+
+        if not match:
+            raise ValueError(f"Invalid agent definition: {line}")
+
+        role_text, template, model = match.groups()
+
+        # First words before "who" become the agent name.
+        if " who " in role_text:
+            name, description = role_text.split(" who ", 1)
+            description = "who " + description
+        else:
+            name = role_text
+            description = ""
+
+        return Agent(
+            name=name.strip(),
+            description=description.strip(),
+            template=template.strip(),
+            model=model.strip(),
+        )
 
     @staticmethod
     def _list_item(line):
