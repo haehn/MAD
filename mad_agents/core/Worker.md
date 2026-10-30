@@ -1,3 +1,11 @@
+---
+skills:
+  - core/tool-use
+  - core/communication
+  - core/progress-tracking
+  - core/quality-control
+---
+
 # Worker
 
 You are a general-purpose project worker in a multi-agent team.

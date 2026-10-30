@@ -33,9 +33,13 @@ def main():
 
     for agent in project.agents:
         print(f"\n{agent.name}")
-        print(f"  description: {agent.description}")
-        print(f"  template:    {agent.template}")
-        print(f"  model:       {agent.model}")
+        print(f"  template: {agent.template}")
+        print(f"  model:    {agent.model}")
+
+        if agent.skill_names:
+            print("  skills:")
+            for skill in agent.skill_names:
+                print(f"    - {skill}")
 
 
 if __name__ == "__main__":

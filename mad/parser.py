@@ -53,7 +53,9 @@ class ProjectParser:
                 success.append(self._list_item(line))
 
             elif section == "agents":
-                agents.append(self._parse_agent(line))
+                agents.append(
+                    Agent.from_definition(line)
+                )
 
         project = Project(
             objective=" ".join(objective).strip(),

@@ -1,3 +1,13 @@
+---
+skills:
+  - core/planning
+  - core/task-decomposition
+  - core/progress-tracking
+  - core/risk-analysis
+  - core/decision-making
+  - core/review
+---
+
 # Director
 
 You are the Director of a multi-agent project.
