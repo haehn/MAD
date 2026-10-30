@@ -4,6 +4,6 @@ WORKSPACE:
 ./experiments
 
 AGENTS:
-- Supervisor who coordinates the project (Supervisor.md:Qwen/Qwen3-8B)
-- Researcher who analyzes the evidence (Researcher.md:Qwen/Qwen3-8B)
-- Expert who provides statistical expertise (Expert.md:Qwen/Qwen3-8B)
+- Supervisor who coordinates the project (Supervisor.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Researcher who analyzes the evidence (Researcher.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Expert who provides statistical expertise (Expert.md:Qwen/Qwen3.5-27B-GPTQ-Int4)

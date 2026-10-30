@@ -21,7 +21,7 @@ SUCCESS:
 - Relevant functionality is verified before completion.
 
 AGENTS:
-- Supervisor who coordinates the project, maintains the task graph, and verifies that the final application satisfies the project goals (Supervisor.md:Qwen/Qwen3-8B)
-- Software Architect who designs the minimal project structure and Three.js scene architecture (Architect.md:Qwen/Qwen3-8B)
-- Three.js Coder who implements the Three.js application, animation, camera controls, and project files (Coder.md:Qwen/Qwen3-8B)
-- Quality Control who reviews the implementation, checks requirements, and identifies bugs or missing functionality (Tester.md:Qwen/Qwen3-8B)
+- Supervisor who coordinates the project, maintains the task graph, and verifies that the final application satisfies the project goals (Supervisor.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Software Architect who designs the minimal project structure and Three.js scene architecture (Architect.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Three.js Coder who implements the Three.js application, animation, camera controls, and project files (Coder.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Quality Control who reviews the implementation, checks requirements, and identifies bugs or missing functionality (Tester.md:Qwen/Qwen3.5-27B-GPTQ-Int4)

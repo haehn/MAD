@@ -17,10 +17,10 @@ SUCCESS:
 - Performance is evaluated for obvious regressions.
 
 AGENTS:
-- Supervisor who plans the full conversion and supervises all other agents (Supervisor.md:Qwen/Qwen3-8B)
-- Software Architect who designs the WebGPU architecture and migration strategy (Architect.md:Qwen/Qwen3-8B)
-- Researcher who studies the current XTK implementation, WebGPU requirements, and relevant migration approaches (Researcher.md:Qwen/Qwen3-8B)
-- Rendering Coder who converts rendering, shaders, interaction, camera, and GPU resource management to WebGPU (Coder.md:Qwen/Qwen3-8B)
-- Data Coder who maintains and adapts file loading, mesh processing, volume processing, and data preparation (Coder.md:Qwen/Qwen3-8B)
-- Debugging Expert who investigates transformation and rendering errors during the migration (Expert.md:Qwen/Qwen3-8B)
-- Quality Control who independently verifies rendering behavior, regressions, compatibility, and tests (Tester.md:Qwen/Qwen3-8B)
+- Supervisor who plans the full conversion and supervises all other agents (Supervisor.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Software Architect who designs the WebGPU architecture and migration strategy (Architect.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Researcher who studies the current XTK implementation, WebGPU requirements, and relevant migration approaches (Researcher.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Rendering Coder who converts rendering, shaders, interaction, camera, and GPU resource management to WebGPU (Coder.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Data Coder who maintains and adapts file loading, mesh processing, volume processing, and data preparation (Coder.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Debugging Expert who investigates transformation and rendering errors during the migration (Expert.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Quality Control who independently verifies rendering behavior, regressions, compatibility, and tests (Tester.md:Qwen/Qwen3.5-27B-GPTQ-Int4)

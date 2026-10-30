@@ -8,5 +8,5 @@ SUCCESS:
 - It recommends the faster option and explains the cost tradeoff and uncertainty.
 
 AGENTS:
-- Supervisor who assigns one writing task and reviews the actual note (Supervisor.md:Qwen/Qwen3-8B)
-- Writer who provides the substantive recommendation directly in task output (Worker.md:Qwen/Qwen3-8B)
+- Supervisor who assigns one writing task and reviews the actual note (Supervisor.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Writer who provides the substantive recommendation directly in task output (Worker.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
