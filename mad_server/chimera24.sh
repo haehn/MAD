@@ -5,7 +5,7 @@ vllm serve Qwen/Qwen3.5-27B-GPTQ-Int4 \
   --host 0.0.0.0 \
   --port 8000 \
   --language-model-only \
-  --max-model-len 8192 \
+  --max-model-len 16834 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 1024 \
   --enforce-eager \
