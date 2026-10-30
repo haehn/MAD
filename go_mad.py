@@ -34,22 +34,29 @@ def main():
 
     project = Project.from_file(args.project)
 
+    # For now every agent gets its own server object,
+    # but all point to the same vLLM endpoint.
+    for agent in project.agents:
+        agent.server = LLM(
+            base_url="http://localhost:8000/v1",
+            show_thinking=args.show_thinking,
+        )
+
     print_banner()
-    print_project(project, verbose=args.verbose)
+    print_project(
+        project,
+        verbose=args.verbose,
+    )
 
     director = project.agents[0]
 
     system_prompt = director.build_system_prompt(project)
 
-    llm = LLM(
-        show_thinking=args.show_thinking
-    )
-
     console.print(
         f"[bold bright_magenta]{director.name.upper()}[/bold bright_magenta]"
     )
 
-    response = llm.chat(
+    response = director.server.chat(
         model=director.model,
         messages=[
             {

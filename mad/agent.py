@@ -16,6 +16,7 @@ class Agent:
         template,
         model,
         mad_root=MAD_ROOT,
+        server=None,
     ):
         self.name = name
         self.description = description
@@ -24,6 +25,7 @@ class Agent:
         self.mad_root = Path(
             mad_root if mad_root is not None else MAD_ROOT
         )
+        self.server = server
 
         self.instructions = ""
         self.skill_names = []
