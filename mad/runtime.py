@@ -32,7 +32,9 @@ def parse_json_response(response):
         response,
     )
 
-    return json.loads(response)
+    return json.loads(
+        response
+    )
 
 
 class Runtime:
@@ -187,7 +189,7 @@ class Runtime:
                 break
 
     #
-    # Initial task graph
+    # Initial plan
     #
 
     async def _handle_plan(
@@ -229,7 +231,7 @@ class Runtime:
         await self._dispatch_ready_tasks()
 
     #
-    # Task result
+    # Worker result
     #
 
     async def _handle_task_result(
@@ -244,9 +246,9 @@ class Runtime:
             task.id
         )
 
-        status = message.metadata.get(
+        proposed_status = message.metadata.get(
             "status",
-            "completed",
+            "blocked",
         )
 
         elapsed = message.metadata.get(
@@ -258,17 +260,32 @@ class Runtime:
             "",
         )
 
+        changed_files = message.metadata.get(
+            "changed_files",
+            [],
+        )
+
+        browser_checks = message.metadata.get(
+            "browser_checks",
+            [],
+        )
+
+        command_results = message.metadata.get(
+            "command_results",
+            [],
+        )
+
         summary = (
             message.content
             or ""
         )
 
-        if status == "completed":
-            task.status = "completed"
+        #
+        # Worker success does NOT mean completed.
+        #
 
-            self.completed_tasks.add(
-                task.id
-            )
+        if proposed_status == "completed":
+            task.status = "review"
 
             timing = (
                 f" in {elapsed:.1f}s"
@@ -277,14 +294,16 @@ class Runtime:
             )
 
             console.print(
-                f"[bold green]"
-                f"✓ {task.id}"
-                f"[/bold green] "
+                f"[bold yellow]"
+                f"◇ {task.id} ready for review"
+                f"[/bold yellow] "
                 f"{task.title} "
                 f"[dim]"
                 f"({message.sender}{timing})"
                 f"[/dim]"
             )
+
+            audit_status = "review"
 
         else:
             task.status = "blocked"
@@ -304,11 +323,13 @@ class Runtime:
                 f"[/dim]"
             )
 
+            audit_status = "blocked"
+
         artifact_path = (
             self.workspace.write_task_result(
                 task=task,
                 agent_name=message.sender,
-                status=status,
+                status=audit_status,
                 summary=summary,
                 output=output,
             )
@@ -327,7 +348,9 @@ class Runtime:
                 f"{message.sender}"
                 f"[/bold cyan]"
             )
-            console.print(summary)
+            console.print(
+                summary
+            )
             console.print()
 
         if output:
@@ -336,43 +359,118 @@ class Runtime:
                 f"{message.sender} result"
                 f"[/bold white]"
             )
-            console.print(output)
+            console.print(
+                output
+            )
             console.print()
 
-        self.pending_replans += 1
+        #
+        # Runtime supplies Director with independent
+        # workspace evidence.
+        #
 
-        replan_content = (
-            f"TASK STATUS:\n"
-            f"{status}\n\n"
-            f"TASK SUMMARY:\n"
-            f"{summary}\n\n"
-            f"AUDIT RECORD:\n"
-            f"{artifact_path}"
-        )
-
-        if output:
-            replan_content += (
-                "\n\nTASK OUTPUT:\n"
-                + output
+        try:
+            workspace_snapshot = await asyncio.to_thread(
+                self.workspace.list_files,
+                ".",
             )
 
-        if (
-            status == "blocked"
-            and "Maximum workspace steps"
-            in summary
-        ):
-            replan_content += """
-            
-IMPORTANT RUNTIME CONTEXT:
+        except Exception as error:
+            workspace_snapshot = (
+                f"[workspace listing failed: {error}]"
+            )
 
-This task stopped because the execution loop reached its workspace
-tool-step limit.
+        evidence = [
+            f"TASK: {task.id} — {task.title}",
+            f"WORKER: {message.sender}",
+            f"WORKER CLAIMED STATUS: {proposed_status}",
+            "",
+            "ACCEPTANCE CRITERIA:",
+        ]
 
-This does NOT demonstrate that the assigned agent lacks the capability
-to perform the task.
+        if task.acceptance:
+            evidence.extend(
+                f"- {item}"
+                for item in task.acceptance
+            )
 
-Do not reassign solely for this reason.
-"""
+        else:
+            evidence.append(
+                "(none)"
+            )
+
+        evidence.extend(
+            [
+                "",
+                "WORKER SUMMARY:",
+                summary or "(none)",
+                "",
+                "WORKER OUTPUT:",
+                output or "(none)",
+                "",
+                "FILES CHANGED BY THIS TASK:",
+            ]
+        )
+
+        if changed_files:
+            evidence.extend(
+                f"- {path}"
+                for path in changed_files
+            )
+
+        else:
+            evidence.append(
+                "(none recorded)"
+            )
+
+        evidence.extend(
+            [
+                "",
+                "CURRENT WORKSPACE SNAPSHOT:",
+                workspace_snapshot,
+            ]
+        )
+
+        if browser_checks:
+            evidence.extend(
+                [
+                    "",
+                    "BROWSER CHECKS:",
+                ]
+            )
+
+            for check in browser_checks:
+                evidence.extend(
+                    [
+                        "---",
+                        check,
+                    ]
+                )
+
+        if command_results:
+            evidence.extend(
+                [
+                    "",
+                    "COMMAND RESULTS:",
+                ]
+            )
+
+            for result in command_results[-5:]:
+                evidence.extend(
+                    [
+                        "---",
+                        result,
+                    ]
+                )
+
+        evidence.extend(
+            [
+                "",
+                f"AUDIT RECORD: {artifact_path}",
+            ]
+        )
+
+        self.pending_replans += 1
 
         await self.hub.send(
             Message(
@@ -380,14 +478,16 @@ Do not reassign solely for this reason.
                 recipient=self.director.name,
                 type="REPLAN_REQUEST",
                 task_id=task.id,
-                content=replan_content,
+                content="\n".join(
+                    evidence
+                ),
                 metadata={
                     "event_type": (
-                        "result"
-                        if status == "completed"
+                        "task_review"
+                        if proposed_status == "completed"
                         else "blocker"
                     ),
-                    "status": status,
+                    "status": task.status,
                     "artifact": str(
                         artifact_path
                     ),
@@ -396,7 +496,7 @@ Do not reassign solely for this reason.
         )
 
     #
-    # Director replanning
+    # Director result
     #
 
     async def _handle_replan_result(
@@ -432,6 +532,31 @@ Do not reassign solely for this reason.
                 f"[dim]{reason}[/dim]"
             )
 
+        reviewed_task = self._find_task(
+            message.task_id
+        )
+
+        #
+        # A review task may NOT silently pass with no action.
+        #
+
+        if (
+            reviewed_task
+            and reviewed_task.status == "review"
+            and not actions
+        ):
+            console.print(
+                "[yellow]"
+                "⚠ Director did not explicitly accept "
+                "the reviewed task. Reopening it."
+                "[/yellow]"
+            )
+
+            reviewed_task.status = "pending"
+
+            await self._dispatch_ready_tasks()
+            return
+
         if not actions:
             console.print(
                 "[dim]"
@@ -441,13 +566,6 @@ Do not reassign solely for this reason.
 
             await self._dispatch_ready_tasks()
             return
-
-        #
-        # Apply proposed changes to a COPY.
-        #
-        # Nothing touches the actual graph until
-        # the whole proposal validates.
-        #
 
         proposed_tasks = copy.deepcopy(
             self.project.tasks
@@ -466,7 +584,15 @@ Do not reassign solely for this reason.
                 "[/bold yellow]"
             )
 
-            await self._recover_blocked_tasks()
+            #
+            # Don't strand review tasks.
+            #
+
+            if (
+                reviewed_task
+                and reviewed_task.status == "review"
+            ):
+                reviewed_task.status = "pending"
 
             await self._dispatch_ready_tasks()
             return
@@ -483,7 +609,11 @@ Do not reassign solely for this reason.
                 "[/bold yellow]"
             )
 
-            await self._recover_blocked_tasks()
+            if (
+                reviewed_task
+                and reviewed_task.status == "review"
+            ):
+                reviewed_task.status = "pending"
 
             await self._dispatch_ready_tasks()
             return
@@ -496,39 +626,14 @@ Do not reassign solely for this reason.
 
         console.print(
             "[green]"
-            "✓ Replan accepted"
+            "✓ Director decision accepted"
             "[/green]"
         )
-
-        await self._recover_blocked_tasks()
 
         await self._dispatch_ready_tasks()
 
     #
-    # Recover simple execution-loop blockers.
-    #
-
-    async def _recover_blocked_tasks(
-        self,
-    ):
-        for task in self.project.tasks:
-            if task.status != "blocked":
-                continue
-
-            #
-            # A blocked task normally requires explicit
-            # Director intervention.
-            #
-            # We do not blindly reopen arbitrary blockers.
-            #
-            # The audit/output remains available to the
-            # Director for an explicit REOPEN action.
-            #
-
-            continue
-
-    #
-    # Replan transaction
+    # Replan actions
     #
 
     def _apply_replan_actions(
@@ -563,7 +668,7 @@ Do not reassign solely for this reason.
             if not task_id:
                 console.print(
                     "[yellow]"
-                    "⚠ Director ADD missing task ID."
+                    "⚠ Director ADD task missing ID."
                     "[/yellow]"
                 )
                 return False
@@ -591,6 +696,12 @@ Do not reassign solely for this reason.
         action_type = action.get(
             "type"
         )
+
+        if action_type == "accept":
+            return self._action_accept(
+                action,
+                tasks,
+            )
 
         if action_type == "add":
             return self._action_add(
@@ -631,6 +742,53 @@ Do not reassign solely for this reason.
         )
 
         return False
+
+    #
+    # ACCEPT
+    #
+
+    def _action_accept(
+        self,
+        action,
+        tasks,
+    ):
+        task_id = action.get(
+            "task_id"
+        )
+
+        task = self._find_task_in(
+            tasks,
+            task_id,
+        )
+
+        if not task:
+            console.print(
+                f"[yellow]"
+                f"⚠ Cannot accept unknown task "
+                f"{task_id!r}"
+                f"[/yellow]"
+            )
+            return False
+
+        if task.status != "review":
+            console.print(
+                f"[yellow]"
+                f"⚠ Cannot accept {task.id}: "
+                f"status is {task.status!r}, "
+                f"expected 'review'"
+                f"[/yellow]"
+            )
+            return False
+
+        task.status = "completed"
+
+        console.print(
+            f"[bold green]"
+            f"✓ {task.id} accepted"
+            f"[/bold green]"
+        )
+
+        return True
 
     #
     # ADD
@@ -745,9 +903,8 @@ Do not reassign solely for this reason.
                 if dependency not in allowed:
                     console.print(
                         f"[yellow]"
-                        f"⚠ {task_id} references "
-                        f"unknown dependency "
-                        f"{dependency!r}"
+                        f"⚠ {task_id} references unknown "
+                        f"dependency {dependency!r}"
                         f"[/yellow]"
                     )
                     return False
@@ -766,12 +923,7 @@ Do not reassign solely for this reason.
                     updates[field],
                 )
 
-        if task.status in {
-            "completed",
-            "blocked",
-            "cancelled",
-        }:
-            task.status = "pending"
+        task.status = "pending"
 
         console.print(
             f"[yellow]~[/yellow] "
@@ -803,12 +955,6 @@ Do not reassign solely for this reason.
         )
 
         if not task:
-            console.print(
-                f"[yellow]"
-                f"⚠ Cannot reassign unknown task "
-                f"{task_id!r}"
-                f"[/yellow]"
-            )
             return False
 
         if not owner:
@@ -822,41 +968,31 @@ Do not reassign solely for this reason.
 
         valid_agents = {
             agent.name
-            for agent
-            in self.project.agents
+            for agent in self.project.agents
         }
 
         if owner not in valid_agents:
             console.print(
                 f"[yellow]"
-                f"⚠ Unknown reassignment owner "
-                f"{owner!r}"
+                f"⚠ Unknown agent {owner!r}"
                 f"[/yellow]"
             )
             return False
 
         if task.status == "running":
-            console.print(
-                f"[yellow]"
-                f"⚠ Cannot reassign running task "
-                f"{task_id}"
-                f"[/yellow]"
-            )
             return False
 
         if task.owner == owner:
             console.print(
                 f"[yellow]"
-                f"⚠ {task_id} already belongs "
+                f"⚠ {task.id} already belongs "
                 f"to {owner}"
                 f"[/yellow]"
             )
             return False
 
         task.owner = owner
-
-        if task.status == "blocked":
-            task.status = "pending"
+        task.status = "pending"
 
         console.print(
             f"[yellow]→[/yellow] "
@@ -981,8 +1117,7 @@ Do not reassign solely for this reason.
     ):
         agent_names = {
             agent.name
-            for agent
-            in self.project.agents
+            for agent in self.project.agents
         }
 
         task_ids = [
@@ -1025,8 +1160,7 @@ Do not reassign solely for this reason.
     ):
         self.completed_tasks = {
             task.id
-            for task
-            in self.project.tasks
+            for task in self.project.tasks
             if task.status == "completed"
         }
 
@@ -1086,6 +1220,17 @@ Do not reassign solely for this reason.
             return False
 
         if self.pending_replans:
+            return False
+
+        #
+        # Anything under Director review means
+        # the project is definitely not finished.
+        #
+
+        if any(
+            task.status == "review"
+            for task in self.project.tasks
+        ):
             return False
 
         pending = [

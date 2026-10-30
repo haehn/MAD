@@ -2,6 +2,7 @@ class Task:
     VALID_STATUSES = {
         "pending",
         "running",
+        "review",
         "completed",
         "blocked",
         "cancelled",
@@ -32,7 +33,10 @@ class Task:
         self.status = status
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(
+        cls,
+        data,
+    ):
         return cls(
             id=data["id"],
             title=data["title"],
@@ -40,7 +44,9 @@ class Task:
                 "description",
                 "",
             ),
-            owner=data.get("owner"),
+            owner=data.get(
+                "owner"
+            ),
             dependencies=data.get(
                 "dependencies",
                 [],

@@ -8,23 +8,35 @@ from mad.ui import console
 
 
 #
-# Task planning
+# Planning
 #
 
 TASK_SCHEMA = {
     "type": "object",
     "properties": {
-        "id": {"type": "string"},
-        "title": {"type": "string"},
-        "description": {"type": "string"},
-        "owner": {"type": "string"},
+        "id": {
+            "type": "string",
+        },
+        "title": {
+            "type": "string",
+        },
+        "description": {
+            "type": "string",
+        },
+        "owner": {
+            "type": "string",
+        },
         "dependencies": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {
+                "type": "string",
+            },
         },
         "acceptance": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {
+                "type": "string",
+            },
         },
     },
     "required": [
@@ -47,7 +59,9 @@ TASK_PLAN_SCHEMA = {
             "items": TASK_SCHEMA,
         },
     },
-    "required": ["tasks"],
+    "required": [
+        "tasks",
+    ],
     "additionalProperties": False,
 }
 
@@ -59,7 +73,9 @@ TASK_PLAN_SCHEMA = {
 MESSAGE_ITEM_SCHEMA = {
     "type": "object",
     "properties": {
-        "recipient": {"type": "string"},
+        "recipient": {
+            "type": "string",
+        },
         "type": {
             "type": "string",
             "enum": [
@@ -72,7 +88,9 @@ MESSAGE_ITEM_SCHEMA = {
                 "discovery",
             ],
         },
-        "content": {"type": "string"},
+        "content": {
+            "type": "string",
+        },
     },
     "required": [
         "recipient",
@@ -91,27 +109,15 @@ MESSAGE_SCHEMA = {
             "items": MESSAGE_ITEM_SCHEMA,
         },
     },
-    "required": ["messages"],
+    "required": [
+        "messages",
+    ],
     "additionalProperties": False,
 }
 
 
 #
 # Workspace tools
-#
-# Only "tool" is mandatory.
-#
-# Examples:
-#
-# {"tool": "list", "path": "."}
-#
-# {"tool": "read", "path": "src/main.js"}
-#
-# {"tool": "write", "path": "index.html", "content": "..."}
-#
-# {"tool": "run", "command": "npm test"}
-#
-# {"tool": "serve", "command": "npm start", "name": "dev"}
 #
 
 TOOL_CALL_SCHEMA = {
@@ -127,6 +133,7 @@ TOOL_CALL_SCHEMA = {
                 "run",
                 "serve",
                 "stop_server",
+                "browser_check",
             ],
         },
         "path": {
@@ -141,6 +148,11 @@ TOOL_CALL_SCHEMA = {
         "name": {
             "type": "string",
         },
+        "wait_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 30000,
+        },
     },
     "required": [
         "tool",
@@ -148,10 +160,6 @@ TOOL_CALL_SCHEMA = {
     "additionalProperties": False,
 }
 
-
-#
-# Tool and final responses are separate.
-#
 
 TASK_DECISION_SCHEMA = {
     "type": "object",
@@ -223,7 +231,7 @@ FINAL_STEP_SCHEMA = {
 
 
 #
-# Replanning
+# Director replanning
 #
 
 REPLAN_ACTION_SCHEMA = {
@@ -232,6 +240,7 @@ REPLAN_ACTION_SCHEMA = {
         "type": {
             "type": "string",
             "enum": [
+                "accept",
                 "add",
                 "revise",
                 "reassign",
@@ -333,7 +342,6 @@ class AgentRuntime:
         self.project = project
         self.hub = hub
         self.workspace = workspace
-
         self.running = True
 
     async def run(self):
@@ -375,19 +383,50 @@ class AgentRuntime:
                     f"{error}"
                 )
 
+    #
+    # Model calls
+    #
+
     async def _chat(
         self,
         messages,
         max_tokens=4096,
         json_schema=None,
+        retries=2,
     ):
-        return await asyncio.to_thread(
-            self.agent.server.chat,
-            model=self.agent.model,
-            messages=messages,
-            max_tokens=max_tokens,
-            json_schema=json_schema,
-        )
+        last_error = None
+
+        for attempt in range(
+            retries + 1
+        ):
+            try:
+                return await asyncio.to_thread(
+                    self.agent.server.chat,
+                    model=self.agent.model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    json_schema=json_schema,
+                )
+
+            except Exception as error:
+                last_error = error
+
+                if attempt >= retries:
+                    raise
+
+                console.print(
+                    f"[yellow]"
+                    f"⚠ {self.agent.name} model request failed "
+                    f"(attempt {attempt + 1}/{retries + 1}): "
+                    f"{error}"
+                    f"[/yellow]"
+                )
+
+                await asyncio.sleep(
+                    1.0
+                )
+
+        raise last_error
 
     async def _structured_chat(
         self,
@@ -461,7 +500,7 @@ class AgentRuntime:
         )
 
     #
-    # Planning
+    # Initial planning
     #
 
     async def _handle_plan_request(
@@ -499,10 +538,9 @@ Create tasks with:
 - dependencies
 - acceptance criteria
 
-Use the available agents according to their roles and skills.
+Use agents according to their roles and skills.
 
 Keep the plan proportional to the project.
-Avoid unnecessary work.
 
 The task graph may evolve as work progresses.
 """.strip()
@@ -553,7 +591,7 @@ The task graph may evolve as work progresses.
         )
 
     #
-    # Replanning
+    # Director review / replanning
     #
 
     async def _handle_replan_request(
@@ -587,7 +625,7 @@ The task graph may evolve as work progresses.
         )
 
         prompt = f"""
-Review the current project plan.
+You are the Director and own the project's task graph.
 
 Event type:
 {event_type}
@@ -598,7 +636,8 @@ From:
 Related task:
 {message.task_id or "None"}
 
-Event:
+Evidence and event:
+
 {message.content}
 
 Current task graph:
@@ -609,32 +648,77 @@ Available agents:
 
 {agent_list}
 
-Only change the graph when the PLAN itself needs changing.
 
-The runtime already manages normal task status transitions.
+DIRECTOR RESPONSIBILITY
+
+Workers do NOT decide that their own work is accepted.
+
+When a worker reports successful completion, the runtime places that
+task into REVIEW.
+
+You must decide whether the evidence is sufficient.
+
+Use ACCEPT only when the task's acceptance criteria are credibly satisfied.
+
+If evidence contradicts the worker's claim, do NOT accept it.
+
+Examples of insufficient evidence:
+
+- claimed files are absent from the workspace snapshot
+- browser validation reports errors
+- tests fail
+- claimed output contradicts actual tool evidence
+- required work was never created
+- quality-control findings identify an unresolved defect
+
+
+ACTIONS
+
+ACCEPT
+Approve a task currently in review.
+
+Required:
+- task_id
+
+REOPEN
+Return a task to pending so its owner performs additional work.
+
+REVISE
+Change the task itself and return it to pending.
+
+REASSIGN
+Move the task to a different appropriate agent.
+
+ADD
+Create a new task.
+
+CANCEL
+Cancel unnecessary work.
+
+
+IMPORTANT
+
+For a task in REVIEW you must either:
+
+- ACCEPT it, or
+- take corrective action on it.
+
+Do not return no actions for a review task.
 
 A workspace-step limit is an execution-loop failure.
-It does not prove the assigned agent lacks the required capability.
-Do not reassign solely because a step limit was reached.
+It does not prove that the agent lacks the capability.
+Do not reassign solely because of a step limit.
 
 For ADD:
 - include the complete task object
-- use a unique task ID
-- use an existing agent as owner
-
-For REVISE:
-- task_id must exist
-- dependencies must reference existing tasks or tasks added
-  in this same replan
+- use a unique ID
+- owner must be an existing agent
 
 For REASSIGN:
-- task_id is required
-- owner is required
+- task_id is mandatory
+- owner is mandatory
 - owner must exactly match an existing agent
-- never use null or an empty owner
-- do not reassign to the same owner
-
-If the plan is still appropriate, return no actions.
+- never use null or empty owner
 """.strip()
 
         result, _ = await self._structured_chat(
@@ -679,6 +763,7 @@ If the plan is still appropriate, return no actions.
                 ),
                 metadata={
                     "elapsed": elapsed,
+                    "event_type": event_type,
                 },
             )
         )
@@ -736,75 +821,45 @@ Workspace:
 
 WORKSPACE TOOLS
 
-Use paths RELATIVE to the workspace.
-
-Examples:
-
-Correct:
-  .
-  README.md
-  src/main.js
-
-Incorrect:
-  threejs-solar/src/main.js
-  /home/user/project/src/main.js
-
+Use paths relative to the workspace.
 
 LIST
 List a directory.
 
-Example:
-{{"tool":"list","path":"."}}
-
-Do NOT put directory contents into the request.
-MAD will return the directory contents after the tool runs.
-
-
 READ
 Read a text file.
-
-Example:
-{{"tool":"read","path":"src/main.js"}}
-
 
 WRITE
 Create or replace a text file.
 
-Example:
-{{"tool":"write","path":"README.md","content":"..."}}
-
-
 APPEND
 Append to a text file.
-
-Example:
-{{"tool":"append","path":"notes.md","content":"..."}}
-
 
 RUN
 Run a command expected to terminate.
 
-Example:
-{{"tool":"run","command":"npm test"}}
-
-
 SERVE
 Start a long-running background process.
-
-Example:
-{{"tool":"serve","command":"npm start","name":"dev"}}
-
 
 STOP_SERVER
 Stop a background process.
 
+BROWSER_CHECK
+Open a workspace HTML file in a real headless browser.
+
 Example:
-{{"tool":"stop_server","name":"dev"}}
 
+{{"tool":"browser_check","path":"index.html","wait_ms":1500}}
 
-Only include fields relevant to the requested tool.
+Tool results are ground truth.
+Do not contradict or invent tool results.
 
-Perform actual workspace work when the task requires artifacts.
+READ an existing file before overwriting it.
+
+A failed tool operation must be resolved or investigated before
+you claim the task is completed.
+
+Your completion claim will be reviewed independently by the Director.
 
 Follow your role instructions and assigned skills.
 
@@ -812,7 +867,7 @@ Available agents:
 
 {agent_list}
 
-Use exact agent names when communicating.
+Use exact agent names.
 """.strip()
 
         conversation = [
@@ -830,17 +885,20 @@ Use exact agent names when communicating.
             },
         ]
 
-        max_steps = 20
+        read_paths = set()
+        changed_files = set()
+        browser_checks = []
+        command_results = []
+
+        unresolved_tool_failure = False
+
+        max_steps = 100
         final_result = None
 
         for step in range(
             1,
             max_steps + 1,
         ):
-            #
-            # Decide whether another tool step is required.
-            #
-
             decision, _ = (
                 await self._structured_chat(
                     conversation
@@ -865,6 +923,24 @@ Use exact agent names when communicating.
                 "state"
             ]
 
+            if (
+                state == "final"
+                and unresolved_tool_failure
+            ):
+                conversation.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The latest workspace step contained "
+                            "a failed operation. Resolve or investigate "
+                            "that failure before claiming completion. "
+                            "If it cannot be resolved, report blocked."
+                        ),
+                    }
+                )
+
+                continue
+
             #
             # Tool step
             #
@@ -879,9 +955,7 @@ Use exact agent names when communicating.
                                 "content": (
                                     "Request only the workspace "
                                     "operations needed next. "
-                                    "Do not predict or invent tool "
-                                    "results. MAD will execute the "
-                                    "tools and return their results."
+                                    "Do not invent results."
                                 ),
                             }
                         ],
@@ -904,15 +978,18 @@ Use exact agent names when communicating.
                 )
 
                 if not tool_calls:
+                    unresolved_tool_failure = True
+
                     conversation.append(
                         {
                             "role": "user",
                             "content": (
                                 "You selected a tool step but "
-                                "requested no workspace operations."
+                                "requested no operations."
                             ),
                         }
                     )
+
                     continue
 
                 console.print(
@@ -923,6 +1000,7 @@ Use exact agent names when communicating.
                 )
 
                 results = []
+                step_failed = False
 
                 for call in tool_calls:
                     tool = call[
@@ -949,8 +1027,13 @@ Use exact agent names when communicating.
                         "",
                     )
 
+                    wait_ms = call.get(
+                        "wait_ms",
+                        1500,
+                    )
+
                     #
-                    # Reject absolute paths.
+                    # Path validation
                     #
 
                     if (
@@ -961,12 +1044,7 @@ Use exact agent names when communicating.
                             "Workspace paths must be relative."
                         )
 
-                        console.print(
-                            f"[yellow]"
-                            f"    {tool} rejected: "
-                            f"{path}"
-                            f"[/yellow]"
-                        )
+                        step_failed = True
 
                         results.append(
                             {
@@ -976,12 +1054,13 @@ Use exact agent names when communicating.
                             }
                         )
 
-                        continue
+                        console.print(
+                            f"[yellow]"
+                            f"    {tool} rejected: {path}"
+                            f"[/yellow]"
+                        )
 
-                    #
-                    # Reject paths that redundantly include
-                    # the workspace directory name.
-                    #
+                        continue
 
                     workspace_name = (
                         self.workspace.root.name
@@ -994,17 +1073,11 @@ Use exact agent names when communicating.
                         )
                     ):
                         error = (
-                            "Path is already relative to the "
-                            "project workspace. Do not include "
-                            f"{workspace_name!r} in the path."
+                            "Do not include the workspace "
+                            "directory name in tool paths."
                         )
 
-                        console.print(
-                            f"[yellow]"
-                            f"    {tool} rejected: "
-                            f"{path}"
-                            f"[/yellow]"
-                        )
+                        step_failed = True
 
                         results.append(
                             {
@@ -1014,18 +1087,103 @@ Use exact agent names when communicating.
                             }
                         )
 
+                        console.print(
+                            f"[yellow]"
+                            f"    {tool} rejected: {path}"
+                            f"[/yellow]"
+                        )
+
+                        continue
+
+                    #
+                    # Read before overwrite
+                    #
+
+                    if (
+                        tool == "write"
+                        and path
+                        and self.workspace.exists(
+                            path
+                        )
+                        and path not in read_paths
+                    ):
+                        error = (
+                            f"{path} exists. "
+                            "READ it before overwriting it."
+                        )
+
+                        step_failed = True
+
+                        results.append(
+                            {
+                                "tool": tool,
+                                "success": False,
+                                "result": error,
+                            }
+                        )
+
+                        console.print(
+                            f"[yellow]"
+                            f"    write rejected: "
+                            f"{path} (read first)"
+                            f"[/yellow]"
+                        )
+
                         continue
 
                     try:
-                        result_text = (
-                            self.workspace.execute_tool(
-                                tool=tool,
-                                path=path,
-                                content=content,
-                                command=command,
-                                name=name,
-                            )
+                        result_text = await asyncio.to_thread(
+                            self.workspace.execute_tool,
+                            tool=tool,
+                            path=path,
+                            content=content,
+                            command=command,
+                            name=name,
+                            wait_ms=wait_ms,
                         )
+
+                        #
+                        # Evidence tracking
+                        #
+
+                        if (
+                            tool == "read"
+                            and path
+                        ):
+                            read_paths.add(
+                                path
+                            )
+
+                        if (
+                            tool in {
+                                "write",
+                                "append",
+                            }
+                            and path
+                        ):
+                            changed_files.add(
+                                path
+                            )
+
+                            read_paths.add(
+                                path
+                            )
+
+                        if tool == "browser_check":
+                            browser_checks.append(
+                                result_text
+                            )
+
+                            if "RESULT: FAIL" in result_text:
+                                step_failed = True
+
+                        if tool == "run":
+                            command_results.append(
+                                result_text
+                            )
+
+                            if "Return code: 0" not in result_text:
+                                step_failed = True
 
                         target = (
                             path
@@ -1043,12 +1201,18 @@ Use exact agent names when communicating.
                         results.append(
                             {
                                 "tool": tool,
-                                "success": True,
+                                "success": not (
+                                    tool == "browser_check"
+                                    and "RESULT: FAIL"
+                                    in result_text
+                                ),
                                 "result": result_text,
                             }
                         )
 
                     except Exception as error:
+                        step_failed = True
+
                         console.print(
                             f"[yellow]"
                             f"    {tool} failed: "
@@ -1066,6 +1230,10 @@ Use exact agent names when communicating.
                             }
                         )
 
+                unresolved_tool_failure = (
+                    step_failed
+                )
+
                 conversation.append(
                     {
                         "role": "assistant",
@@ -1082,9 +1250,8 @@ Use exact agent names when communicating.
                                 results,
                                 indent=2,
                             )
-                            + "\n\nContinue the task. "
-                            "Use these actual results rather "
-                            "than inventing workspace state."
+                            + "\n\nTreat these results as ground truth "
+                            "and continue the task."
                         ),
                     }
                 )
@@ -1092,7 +1259,7 @@ Use exact agent names when communicating.
                 continue
 
             #
-            # Final result
+            # Final
             #
 
             final_data, _ = (
@@ -1102,8 +1269,10 @@ Use exact agent names when communicating.
                         {
                             "role": "user",
                             "content": (
-                                "Return the final task result. "
-                                "Do not request any tools."
+                                "Return your final task result. "
+                                "Do not request tools. "
+                                "The Director will independently "
+                                "review your completion claim."
                             ),
                         }
                     ],
@@ -1142,9 +1311,8 @@ Use exact agent names when communicating.
                     f"({max_steps}) reached."
                 ),
                 "output": (
-                    "Execution stopped because the agent "
-                    "did not converge within the workspace "
-                    "tool-step limit."
+                    "Execution did not converge within "
+                    "the workspace tool-step limit."
                 ),
             }
 
@@ -1153,15 +1321,15 @@ Use exact agent names when communicating.
             - start_time
         )
 
-        status = final_result[
+        proposed_status = final_result[
             "status"
         ]
 
-        if status == "completed":
+        if proposed_status == "completed":
             console.print(
-                f"[bold green]✓[/bold green] "
+                f"[bold yellow]◇[/bold yellow] "
                 f"[bold]{self.agent.name}[/bold] "
-                f"[dim]{task.id} completed "
+                f"[dim]{task.id} submitted for review "
                 f"in {elapsed:.1f}s[/dim]"
             )
 
@@ -1183,11 +1351,16 @@ Use exact agent names when communicating.
                     "summary"
                 ],
                 metadata={
-                    "status": status,
+                    "status": proposed_status,
                     "elapsed": elapsed,
                     "output": final_result[
                         "output"
                     ],
+                    "changed_files": sorted(
+                        changed_files
+                    ),
+                    "browser_checks": browser_checks,
+                    "command_results": command_results,
                 },
             )
         )
@@ -1239,7 +1412,7 @@ Available agents:
 
 {agent_list}
 
-Consider the message according to your role and skills.
+Consider it according to your role and skills.
 
 Respond only when useful.
 Use exact agent names.
@@ -1284,10 +1457,6 @@ Use exact agent names.
             task_id=message.task_id,
         )
 
-    #
-    # Message routing
-    #
-
     async def _route_messages(
         self,
         messages,
@@ -1329,11 +1498,9 @@ Use exact agent names.
                         "",
                     ),
                     metadata={
-                        "message_type": (
-                            outgoing.get(
-                                "type",
-                                "message",
-                            )
+                        "message_type": outgoing.get(
+                            "type",
+                            "message",
                         ),
                     },
                 )

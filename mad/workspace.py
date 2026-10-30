@@ -1,7 +1,12 @@
 from pathlib import Path
+import contextlib
+import http.server
 import re
 import shlex
+import socket
+import socketserver
 import subprocess
+import threading
 
 
 class Workspace:
@@ -84,11 +89,13 @@ class Workspace:
 
         return path
 
-    def _is_ignored(self, path):
-        return any(
-            part in self.IGNORED_NAMES
-            for part in path.parts
-        )
+    def exists(
+        self,
+        relative_path,
+    ):
+        return self._resolve_agent_path(
+            relative_path
+        ).exists()
 
     #
     # File tools
@@ -116,22 +123,15 @@ class Workspace:
 
         results = []
 
-        #
-        # Shallow listing only.
-        #
-        # This prevents enormous responses from things like
-        # node_modules or large repositories.
-        #
-
         for item in sorted(
             path.iterdir(),
             key=lambda p: p.name.lower(),
         ):
+            #
+            # Completely hide internal/noisy directories.
+            #
+
             if item.name in self.IGNORED_NAMES:
-                if item.is_dir():
-                    results.append(
-                        f"{item.name}/"
-                    )
                 continue
 
             relative = item.relative_to(
@@ -228,7 +228,7 @@ class Workspace:
         )
 
     #
-    # Terminating command
+    # Commands
     #
 
     def run(
@@ -289,7 +289,7 @@ class Workspace:
         return text
 
     #
-    # Long-running server
+    # Background servers
     #
 
     def serve(
@@ -399,6 +399,239 @@ class Workspace:
         return results
 
     #
+    # Browser validation
+    #
+
+    def _find_free_port(self):
+        with contextlib.closing(
+            socket.socket(
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+            )
+        ) as sock:
+            sock.bind(
+                ("127.0.0.1", 0)
+            )
+
+            return sock.getsockname()[1]
+
+    def browser_check(
+        self,
+        relative_path="index.html",
+        wait_ms=1500,
+    ):
+        target = self._resolve_agent_path(
+            relative_path
+        )
+
+        if not target.exists():
+            raise FileNotFoundError(
+                f"Browser target does not exist: "
+                f"{relative_path}"
+            )
+
+        if not target.is_file():
+            raise ValueError(
+                f"Browser target is not a file: "
+                f"{relative_path}"
+            )
+
+        try:
+            from playwright.sync_api import (
+                sync_playwright,
+            )
+
+        except ImportError as error:
+            raise RuntimeError(
+                "Playwright is not installed. "
+                "Run: pip install playwright && "
+                "playwright install chromium"
+            ) from error
+
+        port = self._find_free_port()
+
+        class QuietHandler(
+            http.server.SimpleHTTPRequestHandler
+        ):
+            def log_message(
+                self,
+                format,
+                *args,
+            ):
+                pass
+
+        def handler(
+            *args,
+            **kwargs,
+        ):
+            return QuietHandler(
+                *args,
+                directory=str(self.root),
+                **kwargs,
+            )
+
+        server = socketserver.TCPServer(
+            ("127.0.0.1", port),
+            handler,
+        )
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+
+        thread.start()
+
+        relative_url = target.relative_to(
+            self.root
+        ).as_posix()
+
+        url = (
+            f"http://127.0.0.1:"
+            f"{port}/{relative_url}"
+        )
+
+        console_errors = []
+        console_warnings = []
+        page_errors = []
+        request_failures = []
+
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=True
+                )
+
+                page = browser.new_page()
+
+                def on_console(message):
+                    if message.type == "error":
+                        console_errors.append(
+                            message.text
+                        )
+
+                    elif message.type == "warning":
+                        console_warnings.append(
+                            message.text
+                        )
+
+                page.on(
+                    "console",
+                    on_console,
+                )
+
+                page.on(
+                    "pageerror",
+                    lambda error: page_errors.append(
+                        str(error)
+                    ),
+                )
+
+                page.on(
+                    "requestfailed",
+                    lambda request: (
+                        request_failures.append(
+                            f"{request.method} "
+                            f"{request.url}: "
+                            f"{request.failure}"
+                        )
+                    ),
+                )
+
+                response = page.goto(
+                    url,
+                    wait_until="load",
+                    timeout=15000,
+                )
+
+                page.wait_for_timeout(
+                    wait_ms
+                )
+
+                title = page.title()
+
+                status_code = (
+                    response.status
+                    if response
+                    else None
+                )
+
+                browser.close()
+
+        finally:
+            server.shutdown()
+            server.server_close()
+
+            thread.join(
+                timeout=2
+            )
+
+        errors = (
+            page_errors
+            + console_errors
+            + request_failures
+        )
+
+        output = [
+            f"URL: {url}",
+            f"HTTP status: {status_code}",
+            f"Title: {title!r}",
+            f"Runtime errors: {len(errors)}",
+            f"Warnings: {len(console_warnings)}",
+        ]
+
+        if errors:
+            output.extend(
+                [
+                    "",
+                    "ERRORS:",
+                ]
+            )
+
+            for error in errors:
+                output.append(
+                    f"- {error}"
+                )
+
+        if console_warnings:
+            output.extend(
+                [
+                    "",
+                    "WARNINGS:",
+                ]
+            )
+
+            for warning in console_warnings:
+                output.append(
+                    f"- {warning}"
+                )
+
+        if errors:
+            output.extend(
+                [
+                    "",
+                    "RESULT: FAIL",
+                    "Browser/runtime errors were detected.",
+                ]
+            )
+
+        else:
+            output.extend(
+                [
+                    "",
+                    "RESULT: PASS",
+                    (
+                        "Page loaded without detected "
+                        "JavaScript runtime errors."
+                    ),
+                ]
+            )
+
+        return "\n".join(
+            output
+        )
+
+    #
     # Tool dispatcher
     #
 
@@ -409,6 +642,7 @@ class Workspace:
         content="",
         command="",
         name="",
+        wait_ms=1500,
     ):
         if tool == "list":
             return self.list_files(
@@ -448,12 +682,20 @@ class Workspace:
                 name=name or "default"
             )
 
+        if tool == "browser_check":
+            return self.browser_check(
+                relative_path=(
+                    path or "index.html"
+                ),
+                wait_ms=wait_ms,
+            )
+
         raise ValueError(
             f"Unknown workspace tool: {tool}"
         )
 
     #
-    # Audit
+    # Audit trail
     #
 
     def write_task_result(
