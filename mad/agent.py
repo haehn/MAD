@@ -58,7 +58,7 @@ class Agent:
             description=description.strip(),
             template=template.strip(),
             model=model.strip(),
-            root_dir=root_dir,
+            mad_root=mad_root,
         )
 
     def _find_template(self):
