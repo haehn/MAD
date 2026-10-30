@@ -19,4 +19,4 @@ AGENTS:
 - Researcher who studies relevant existing approaches and informs the Supervisor (Researcher.md:Qwen/Qwen3-8B)
 - Backend Coder who implements the backend and API (Coder.md:Qwen/Qwen3-8B)
 - Frontend Coder who implements the user interface and integrates it with the API (Coder.md:Qwen/Qwen3-8B)
-- Quality Control who independently tests and verifies the completed work (SoftwareTester.md:Qwen/Qwen3-8B)
+- Quality Control who independently tests and verifies the completed work (Tester.md:Qwen/Qwen3-8B)

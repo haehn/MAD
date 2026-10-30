@@ -23,4 +23,4 @@ AGENTS:
 - Rendering Coder who converts rendering, shaders, interaction, camera, and GPU resource management to WebGPU (Coder.md:Qwen/Qwen3-8B)
 - Data Coder who maintains and adapts file loading, mesh processing, volume processing, and data preparation (Coder.md:Qwen/Qwen3-8B)
 - Debugging Expert who investigates transformation and rendering errors during the migration (Expert.md:Qwen/Qwen3-8B)
-- Quality Control who independently verifies rendering behavior, regressions, compatibility, and tests (SoftwareTester.md:Qwen/Qwen3-8B)
+- Quality Control who independently verifies rendering behavior, regressions, compatibility, and tests (Tester.md:Qwen/Qwen3-8B)

@@ -49,10 +49,12 @@ def main():
         verbose=args.verbose,
     )
 
-    asyncio.run(
+    accepted = asyncio.run(
         runtime.run()
     )
 
+    return 0 if accepted else 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

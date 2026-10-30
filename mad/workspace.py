@@ -1,719 +1,224 @@
-from pathlib import Path
-from mad.audit_store import AuditStore
-from mad.tool_result import ToolResult
-import contextlib
+"""Generic workspace operations and passive audit files."""
+import functools
 import http.server
+import json
+from pathlib import Path
 import re
 import shlex
-import socket
 import socketserver
 import subprocess
 import threading
+import time
+from urllib.parse import quote
 
 
 class Workspace:
-    IGNORED_NAMES = {
-        ".git",
-        ".mad",
-        "node_modules",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".venv",
-        "venv",
-    }
+    IGNORED_NAMES = {'.git', '.mad', 'node_modules', '__pycache__', '.venv', 'venv',
+                     '.pytest_cache', '.mypy_cache'}
 
     def __init__(self, path):
         self.root = Path(path).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.audit = self.root / '.mad' / 'audit'
+        self.audit.mkdir(parents=True, exist_ok=True)
+        self.servers, self.evidence = {}, {}
+        self.run_id, self.sequence = str(time.time_ns()), 0
 
-        self.root.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.mad = self.root / ".mad"
-        self.audit = self.mad / "audit"
-
-        self.audit.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.audit_store = AuditStore(self.root)
-        self.servers = {}
-
-    #
-    # Paths
-    #
-
-    def _safe_name(self, value):
-        return re.sub(
-            r"[^A-Za-z0-9_.-]+",
-            "_",
-            value,
-        )
-
-    def _resolve(self, relative_path):
-        relative_path = relative_path.strip()
-
-        if not relative_path:
-            return self.root
-
-        path = (
-            self.root
-            / relative_path
-        ).resolve()
-
-        if (
-            path != self.root
-            and self.root not in path.parents
-        ):
-            raise ValueError(
-                f"Path escapes workspace: {relative_path}"
-            )
-
+    def path(self, value='.'):
+        value = value.strip()
+        while value.startswith('./'):
+            value = value[2:]
+        if Path(value).is_absolute():
+            raise ValueError('Use workspace-relative paths, such as "." or "main.js".')
+        if value == self.root.name or value.startswith(self.root.name + '/'):
+            raise ValueError('Do not include the workspace name. Use "." or a workspace-relative filename.')
+        path = (self.root / value).resolve()
+        if path != self.root and self.root not in path.parents:
+            raise ValueError('Path escapes the workspace.')
+        internal = self.root / '.mad'
+        if path == internal or internal in path.parents:
+            raise ValueError('Agents cannot access .mad audit files as deliverables.')
         return path
 
-    def _resolve_agent_path(
-        self,
-        relative_path,
-    ):
-        path = self._resolve(
-            relative_path
-        )
+    def list_files(self, path='.'):
+        target = self.path(path)
+        if not target.exists():
+            raise FileNotFoundError(path)
+        if target.is_file():
+            return str(target.relative_to(self.root))
+        return '\n'.join(str(item.relative_to(self.root)) + ('/' if item.is_dir() else '')
+                         for item in sorted(target.iterdir()) if item.name not in self.IGNORED_NAMES) or '(directory is empty)'
 
-        if (
-            path == self.mad
-            or self.mad in path.parents
-        ):
-            raise ValueError(
-                "Agents cannot access the .mad directory."
-            )
+    def read(self, path):
+        return self.path(path).read_text(encoding='utf-8')
 
-        return path
+    def write(self, path, content, append=False):
+        target = self.path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open('a' if append else 'w', encoding='utf-8') as output:
+            output.write(content)
+        return f'Wrote {len(content)} characters to {target.relative_to(self.root)}'
 
-    def exists(
-        self,
-        relative_path,
-    ):
-        return self._resolve_agent_path(
-            relative_path
-        ).exists()
-
-    #
-    # File tools
-    #
-
-    def list_files(
-        self,
-        relative_path=".",
-    ):
-        path = self._resolve_agent_path(
-            relative_path
-        )
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Path does not exist: {relative_path}"
-            )
-
-        if path.is_file():
-            return str(
-                path.relative_to(
-                    self.root
-                )
-            )
-
-        results = []
-
-        for item in sorted(
-            path.iterdir(),
-            key=lambda p: p.name.lower(),
-        ):
-            #
-            # Completely hide internal/noisy directories.
-            #
-
-            if item.name in self.IGNORED_NAMES:
-                continue
-
-            relative = item.relative_to(
-                self.root
-            )
-
-            if item.is_dir():
-                results.append(
-                    f"{relative}/"
-                )
-            else:
-                results.append(
-                    str(relative)
-                )
-
-        if not results:
-            return "(directory is empty)"
-
-        return "\n".join(
-            results
-        )
-
-    def read(
-        self,
-        relative_path,
-    ):
-        path = self._resolve_agent_path(
-            relative_path
-        )
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"File does not exist: {relative_path}"
-            )
-
-        if not path.is_file():
-            raise ValueError(
-                f"Not a file: {relative_path}"
-            )
-
-        return path.read_text(
-            encoding="utf-8"
-        )
-
-    def write(
-        self,
-        relative_path,
-        content,
-    ):
-        path = self._resolve_agent_path(
-            relative_path
-        )
-
-        path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        path.write_text(
-            content,
-            encoding="utf-8",
-        )
-
-        return (
-            f"Wrote {len(content)} characters "
-            f"to {path.relative_to(self.root)}"
-        )
-
-    def append(
-        self,
-        relative_path,
-        content,
-    ):
-        path = self._resolve_agent_path(
-            relative_path
-        )
-
-        path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        with path.open(
-            "a",
-            encoding="utf-8",
-        ) as file:
-            file.write(
-                content
-            )
-
-        return (
-            f"Appended {len(content)} characters "
-            f"to {path.relative_to(self.root)}"
-        )
-
-    #
-    # Commands
-    #
-
-    def run(
-        self,
-        command,
-        timeout=120,
-        structured=False,
-    ):
-        arguments = shlex.split(
-            command
-        )
-
+    def run(self, command):
+        arguments = shlex.split(command)
         if not arguments:
-            raise ValueError(
-                "Empty command."
-            )
+            raise ValueError('Empty command.')
+        result = subprocess.run(arguments, cwd=self.root, capture_output=True, text=True, timeout=120)
+        text = f'Command: {command}\nReturn code: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}'
+        return {'success': result.returncode == 0, 'result': text[:20000]}
 
-        result = subprocess.run(
-            arguments,
-            cwd=self.root,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-
-        output = [
-            f"Command: {command}",
-            f"Return code: {result.returncode}",
-        ]
-
-        if result.stdout:
-            output.extend(
-                [
-                    "",
-                    "STDOUT:",
-                    result.stdout,
-                ]
-            )
-
-        if result.stderr:
-            output.extend(
-                [
-                    "",
-                    "STDERR:",
-                    result.stderr,
-                ]
-            )
-
-        text = "\n".join(
-            output
-        )
-
-        if len(text) > 20000:
-            text = (
-                text[:20000]
-                + "\n\n[output truncated]"
-            )
-
-        if structured:
-            return ToolResult(result.returncode == 0, text)
-        return text
-
-    #
-    # Background servers
-    #
-
-    def serve(
-        self,
-        command,
-        name="default",
-    ):
-        if name in self.servers:
-            process = self.servers[
-                name
-            ]
-
-            if process.poll() is None:
-                return (
-                    f"Server {name!r} is already running "
-                    f"with PID {process.pid}"
-                )
-
-            del self.servers[
-                name
-            ]
-
-        arguments = shlex.split(
-            command
-        )
-
+    def serve(self, command, name='default'):
+        if name in self.servers and self.servers[name].poll() is None:
+            return f'Server {name} is already running.'
+        arguments = shlex.split(command)
         if not arguments:
-            raise ValueError(
-                "Empty command."
-            )
+            raise ValueError('Empty command.')
+        log = self.audit / ('server-' + re.sub(r'[^A-Za-z0-9_.-]', '_', name) + '.log')
+        with log.open('a', encoding='utf-8') as output:
+            self.servers[name] = subprocess.Popen(arguments, cwd=self.root, stdout=output,
+                                                  stderr=subprocess.STDOUT, start_new_session=True)
+        return f'Started {name}, PID {self.servers[name].pid}.'
 
-        log_path = (
-            self.mad
-            / f"server-{self._safe_name(name)}.log"
-        )
-
-        log_file = log_path.open(
-            "a",
-            encoding="utf-8",
-        )
-
-        process = subprocess.Popen(
-            arguments,
-            cwd=self.root,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-
-        self.servers[
-            name
-        ] = process
-
-        return (
-            f"Started server {name!r} "
-            f"with PID {process.pid}. "
-            f"Log: {log_path.relative_to(self.root)}"
-        )
-
-    def stop_server(
-        self,
-        name,
-    ):
-        process = self.servers.get(
-            name
-        )
-
-        if process is None:
-            return (
-                f"No server named {name!r} is running."
-            )
-
-        if process.poll() is None:
+    def stop_server(self, name='default'):
+        process = self.servers.pop(name, None)
+        if process and process.poll() is None:
             process.terminate()
-
             try:
-                process.wait(
-                    timeout=5
-                )
-
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-
-        del self.servers[
-            name
-        ]
-
-        return (
-            f"Stopped server {name!r}."
-        )
+                process.wait()
+        return f'Stopped {name}.'
 
     def stop_servers(self):
-        names = list(
-            self.servers.keys()
-        )
+        for name in list(self.servers):
+            self.stop_server(name)
 
-        results = []
-
-        for name in names:
-            results.append(
-                self.stop_server(
-                    name
-                )
-            )
-
-        return results
-
-    #
-    # Browser validation
-    #
-
-    def _find_free_port(self):
-        with contextlib.closing(
-            socket.socket(
-                socket.AF_INET,
-                socket.SOCK_STREAM,
-            )
-        ) as sock:
-            sock.bind(
-                ("127.0.0.1", 0)
-            )
-
-            return sock.getsockname()[1]
-
-    def browser_check(
-        self,
-        relative_path="index.html",
-        wait_ms=1500,
-        structured=False,
-    ):
-        target = self._resolve_agent_path(
-            relative_path
-        )
-
-        if not target.exists():
-            raise FileNotFoundError(
-                f"Browser target does not exist: "
-                f"{relative_path}"
-            )
-
+    def browser_check(self, path='index.html', wait_ms=1500):
+        from playwright.sync_api import sync_playwright
+        target = self.path(path)
         if not target.is_file():
-            raise ValueError(
-                f"Browser target is not a file: "
-                f"{relative_path}"
-            )
-
-        try:
-            from playwright.sync_api import (
-                sync_playwright,
-            )
-
-        except ImportError as error:
-            raise RuntimeError(
-                "Playwright is not installed. "
-                "Run: pip install playwright && "
-                "playwright install chromium"
-            ) from error
-
-        port = self._find_free_port()
-
-        class QuietHandler(
-            http.server.SimpleHTTPRequestHandler
-        ):
-            def log_message(
-                self,
-                format,
-                *args,
-            ):
+            raise FileNotFoundError(path)
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, format, *args):
                 pass
 
-        def handler(
-            *args,
-            **kwargs,
-        ):
-            return QuietHandler(
-                *args,
-                directory=str(self.root),
-                **kwargs,
-            )
-
-        server = socketserver.TCPServer(
-            ("127.0.0.1", port),
-            handler,
-        )
-
-        thread = threading.Thread(
-            target=server.serve_forever,
-            daemon=True,
-        )
-
+        handler = functools.partial(Handler, directory=str(self.root))
+        server = socketserver.TCPServer(('127.0.0.1', 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-
-        relative_url = target.relative_to(
-            self.root
-        ).as_posix()
-
-        url = (
-            f"http://127.0.0.1:"
-            f"{port}/{relative_url}"
-        )
-
-        console_errors = []
-        console_warnings = []
-        page_errors = []
-        request_failures = []
-
+        errors, warnings = [], []
         try:
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
-                    headless=True
-                )
-
-                page = browser.new_page()
-
-                def on_console(message):
-                    if message.type == "error":
-                        console_errors.append(
-                            message.text
-                        )
-
-                    elif message.type == "warning":
-                        console_warnings.append(
-                            message.text
-                        )
-
-                page.on(
-                    "console",
-                    on_console,
-                )
-
-                page.on(
-                    "pageerror",
-                    lambda error: page_errors.append(
-                        str(error)
-                    ),
-                )
-
-                page.on(
-                    "requestfailed",
-                    lambda request: (
-                        request_failures.append(
-                            f"{request.method} "
-                            f"{request.url}: "
-                            f"{request.failure}"
-                        )
-                    ),
-                )
-
-                response = page.goto(
-                    url,
-                    wait_until="load",
-                    timeout=15000,
-                )
-
-                page.wait_for_timeout(
-                    wait_ms
-                )
-
-                title = page.title()
-
-                status_code = (
-                    response.status
-                    if response
-                    else None
-                )
-
-                browser.close()
-
+                browser = playwright.chromium.launch(headless=True)
+                try:
+                    page = browser.new_page()
+                    page.on('pageerror', lambda error: errors.append(str(error)))
+                    page.on('requestfailed', lambda request: errors.append(f'{request.url}: {request.failure}'))
+                    page.on('console', lambda message: (errors if message.type == 'error' else warnings).append(message.text)
+                            if message.type in {'error', 'warning'} else None)
+                    url = f'http://127.0.0.1:{server.server_address[1]}/' + quote(target.relative_to(self.root).as_posix())
+                    response = page.goto(url, wait_until='load', timeout=15000)
+                    page.wait_for_timeout(wait_ms)
+                    status = response.status if response else None
+                    if status is None or status >= 400:
+                        errors.append(f'HTTP status: {status}')
+                    return {'success': not errors, 'result': json.dumps({
+                        'url': url, 'status': status, 'title': page.title(), 'errors': errors,
+                        'warnings': warnings, 'scope': 'Page loading and runtime errors only; behavior is not verified.',
+                    })}
+                finally:
+                    browser.close()
         finally:
             server.shutdown()
             server.server_close()
+            thread.join(timeout=2)
 
-            thread.join(
-                timeout=2
-            )
+    def execute(self, call, reads, review=False):
+        tool = call['tool']
+        path = call.get('path', '')
+        try:
+            if review and tool in {'write', 'append'}:
+                raise ValueError('Assign corrective work instead of writing during review.')
+            target = self.path(path)
+            if tool == 'write' and target.exists() and target not in reads:
+                raise ValueError('Read the existing file before overwriting it.')
+            if tool == 'list':
+                result = self.list_files(path or '.')
+            elif tool == 'read':
+                result = self.read(path)
+                reads.add(target)
+            elif tool in {'write', 'append'}:
+                result = self.write(path, call.get('content', ''), append=tool == 'append')
+                reads.add(target)
+            elif tool == 'run':
+                return self.run(call.get('command', ''))
+            elif tool == 'serve':
+                result = self.serve(call.get('command', ''), call.get('name') or 'default')
+            elif tool == 'stop_server':
+                result = self.stop_server(call.get('name') or 'default')
+            elif tool == 'browser_check':
+                return self.browser_check(path or 'index.html', call.get('wait_ms', 1500))
+            else:
+                raise ValueError(f'Unknown tool: {tool}')
+            return {'success': True, 'result': result}
+        except Exception as error:
+            return {'success': False, 'result': str(error)}
 
-        errors = (
-            page_errors
-            + console_errors
-            + request_failures
-        )
+    def require_artifacts(self, paths):
+        for path in paths:
+            if not self.path(path).is_file():
+                raise ValueError(f'Required artifact is missing: {path}. Create the file with a workspace tool, or report blocked.')
 
-        output = [
-            f"URL: {url}",
-            f"HTTP status: {status_code}",
-            f"Title: {title!r}",
-            f"Runtime errors: {len(errors)}",
-            f"Warnings: {len(console_warnings)}",
-        ]
+    def record(self, actor, action, result, task_id=None):
+        self.sequence += 1
+        record = dict(id=f'E{self.sequence}', run_id=self.run_id, actor=actor,
+                      task_id=task_id, request=action, **result)
+        with (self.audit / 'events.jsonl').open('a', encoding='utf-8') as output:
+            output.write(json.dumps(record, ensure_ascii=False) + '\n')
+        if action.get('action') in {'tool', 'result'}:
+            self.evidence[record['id']] = record
+        return record
 
-        if errors:
-            output.extend(
-                [
-                    "",
-                    "ERRORS:",
-                ]
-            )
-
-            for error in errors:
-                output.append(
-                    f"- {error}"
-                )
-
-        if console_warnings:
-            output.extend(
-                [
-                    "",
-                    "WARNINGS:",
-                ]
-            )
-
-            for warning in console_warnings:
-                output.append(
-                    f"- {warning}"
-                )
-
-        if errors:
-            output.extend(
-                [
-                    "",
-                    "RESULT: FAIL",
-                    "Browser/runtime errors were detected.",
-                ]
-            )
-
-        else:
-            output.extend(
-                [
-                    "",
-                    "RESULT: PASS",
-                    (
-                        "Page loaded without detected "
-                        "JavaScript runtime errors."
-                    ),
-                ]
-            )
-
-        text = "\n".join(output)
-        if structured:
-            return ToolResult(not errors, text)
-        return text
-
-    #
-    # Tool dispatcher
-    #
-
-    def execute_tool(
-        self,
-        tool,
-        path="",
-        content="",
-        command="",
-        name="",
-        wait_ms=1500,
-    ):
-        if tool == "list":
-            return self.list_files(
-                path or "."
-            )
-
-        if tool == "read":
-            return self.read(
-                path
-            )
-
-        if tool == "write":
-            return self.write(
-                path,
-                content,
-            )
-
-        if tool == "append":
-            return self.append(
-                path,
-                content,
-            )
-
-        if tool == "run":
-            return self.run(
-                command
-            )
-
-        if tool == "serve":
-            return self.serve(
-                command=command,
-                name=name or "default",
-            )
-
-        if tool == "stop_server":
-            return self.stop_server(
-                name=name or "default"
-            )
-
-        if tool == "browser_check":
-            return self.browser_check(
-                relative_path=(
-                    path or "index.html"
-                ),
-                wait_ms=wait_ms,
-            )
-
-        raise ValueError(
-            f"Unknown workspace tool: {tool}"
-        )
-
-    def execute_tool_result(self, tool, **arguments):
-        """Structured outcome for sessions; execute_tool retains its text API."""
-        if tool == "run":
-            return self.run(arguments.get("command", ""), structured=True)
-        if tool == "browser_check":
-            return self.browser_check(
-                arguments.get("path") or "index.html",
-                wait_ms=arguments.get("wait_ms", 1500),
-                structured=True,
-            )
-        return ToolResult(True, self.execute_tool(tool, **arguments))
-
-    def write_task_result(self, task, agent_name, status, summary, output):
-        """Compatibility entry point; reports are owned by AuditStore."""
-        return self.audit_store.write_task_result(task, agent_name, status, summary, output)
+    def task_report(self, task):
+        name = re.sub(r'[^A-Za-z0-9_.-]', '_', task.id)
+        path = self.audit / f'{name}.md'
+        lines = [f'# {task.id}: {task.title}', '', f'Agent: {task.owner}',
+                 f'Status: {task.status}', '', '## Assignment', '',
+                 task.description or '(No description supplied.)', '', '### Acceptance criteria', '']
+        lines.extend(f'- {item}' for item in task.acceptance)
+        if not task.acceptance:
+            lines.append('(None specified.)')
+        lines.extend(['', '### Required deliverables', ''])
+        lines.extend(f'- `{item}`' for item in task.artifacts)
+        if not task.artifacts:
+            lines.append('Inline output; no required files.')
+        records = [record for record in self.evidence.values()
+                   if record['task_id'] == task.id and record['request'].get('action') == 'tool']
+        lines.extend(['', '## Work performed', ''])
+        for record in records:
+            call = record['request']
+            target = call.get('command') or call.get('path') or call.get('name') or '.'
+            status = 'OK' if record['success'] else 'FAILED'
+            lines.append(f"- {record['id']} — {call['tool']} {target}: {status}")
+        if not records:
+            lines.append('No workspace operations recorded.')
+        lines.extend(['', '## Verification and failures', ''])
+        checks = [record for record in records if not record['success']
+                  or record['request']['tool'] in {'run', 'browser_check'}]
+        for record in checks:
+            lines.extend([f"### {record['id']}: {record['request']['tool']}", ''])
+            output = record.get('result', record.get('error', ''))
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False, indent=2)
+            lines.extend('    ' + line for line in output.splitlines())
+            lines.append('')
+        if not checks:
+            lines.append('No command or browser checks, or failed tools, recorded. This does not establish correctness.')
+        lines.extend(['', '## Submitted result', '', task.result.get('summary') or '(No summary.)',
+                      '', task.result.get('output') or '(No substantive output.)', '',
+                      '## Supervisor decision', '', f'Current task status: {task.status}', '',
+                      task.feedback or 'Awaiting Supervisor review.', '',
+                      'Full action history: [events.jsonl](events.jsonl). Evidence IDs refer to this run.', ''])
+        path.write_text('\n'.join(lines), encoding='utf-8')
+        return path

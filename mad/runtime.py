@@ -1,255 +1,208 @@
-"""Compose MAD services and orchestrate project messages and task scheduling."""
+"""Connect agents, tasks, tools, and inboxes using one action handler."""
 import asyncio
-from mad.agent_runtime import AgentRuntime
-from mad.llm import LLM
-from mad.message import Message
-from mad.message_hub import MessageHub
-from mad.protocol import parse_json_response
-from mad.review_service import ReviewService
-from mad.project_state import ProjectState
-from mad.reporter import Reporter
-from mad.task import Task
+import json
+from mad import ui
+from mad.messaging import Message, MessageHub
+from mad.project import ProjectState
 from mad.workspace import Workspace
 
 
 class Runtime:
-    def __init__(self, project, server='http://localhost:8000/v1',
-                 show_thinking=False, verbose=False, model_factory=None,
-                 reporter=None, workspace=None):
-        self.project = project
-        self.server = server
-        self.show_thinking = show_thinking
-        self.verbose = verbose
-        self.workspace = workspace if workspace is not None else Workspace(project.workspace)
-        self.reporter = reporter if reporter is not None else Reporter()
-        self.model_factory = model_factory or (lambda agent: LLM(
-            base_url=server, show_thinking=show_thinking))
+    def __init__(self, project, server='http://localhost:8000/v1', show_thinking=False,
+                 verbose=False):
+        self.project, self.verbose = project, verbose
         self.state = ProjectState(project)
+        self.workspace = Workspace(project.workspace)
         self.hub = MessageHub()
-        self.agent_runtimes = {}
-        self.runtime_tasks = []
-        self.pending_reviews = set()
-        self.supervisor = None
-        self.project_accepted = False
-        self.project_review_pending = False
-        self.project_review_attempted = False
-        self.project_evidence = {}
-        self.task_feedback = {}
-        self.review_attempts = {}
+        self.server = server.rstrip('/')
+        self.show_thinking = show_thinking
+        self.pending_reviews, self.workers = set(), []
+        self.finished = asyncio.Event()
+        self.project_accepted, self.final_queued, self.error = False, False, None
 
-    @property
-    def running_tasks(self):
-        return self.state.running
+    def _evidence(self, ids):
+        return {ref: self.workspace.evidence[ref] for ref in ids if ref in self.workspace.evidence}
 
-    @property
-    def completed_tasks(self):
-        return self.state.completed
+    def _context(self, event, task=None, records=None):
+        data = {'event': event, 'workspace': str(self.workspace.root),
+                'files': self.workspace.list_files(), 'task': task.to_dict() if task else None,
+                'tasks': [item.to_dict() for item in self.state.tasks],
+                'success': self.project.success or [self.project.objective],
+                'evidence': records or {}}
+        text = json.dumps(data, ensure_ascii=False)
+        if len(text) > 50000:
+            text = text[:50000] + '\n[Evidence excerpt truncated; inspect artifacts or request more material.]'
+        if event == 'review':
+            supervisor = next(agent for agent in self.project.agents if agent.name == self.state.supervisor)
+            text = supervisor.review_instruction + '\n\n' + text
+        return text
 
-    @property
-    def pending_replans(self):
-        return len(self.pending_reviews)
+    def _actions(self, agent, event):
+        if event.type == 'PEER':
+            return ['done'] if event.metadata.get('reply') else ['message', 'done']
+        if event.type == 'TASK':
+            return ['tool', 'message', 'result']
+        self.state.require_supervisor(agent.name)
+        return {'PLAN': ['tool', 'message', 'plan'],
+                'REVIEW': ['tool', 'message', 'review', 'replan'],
+                'PROJECT': ['tool', 'message', 'replan', 'finish']}[event.type]
 
     async def run(self):
-        self._find_supervisor()
-        self._initialize_agents()
-        self.reporter.start(self.project, self.workspace.root, self.verbose)
-        try:
-            self.runtime_tasks = [asyncio.create_task(runtime.run())
-                                  for runtime in self.agent_runtimes.values()]
-            await self.hub.send(Message(
-                sender='__runtime__', recipient=self.supervisor.name, type='PLAN_REQUEST',
-                metadata={'agents': [agent.name for agent in self.project.agents]},
-            ))
-            await self._runtime_loop()
-        finally:
-            await self._shutdown()
-
-    def _initialize_agents(self):
-        names = [agent.name for agent in self.project.agents]
-        if len(names) != len(set(names)) or '__runtime__' in names:
-            raise ValueError('Agent names must be unique and cannot be __runtime__.')
-        self.hub.register('__runtime__')
+        ui.start(self.project, self.workspace.root, self.verbose)
         for agent in self.project.agents:
+            agent.server = self.server
+            agent.show_thinking = self.show_thinking
             self.hub.register(agent.name)
-            agent.server = self.model_factory(agent)
-            agent.message_hub = self.hub
-            self.agent_runtimes[agent.name] = AgentRuntime(
-                agent, self.project, self.hub, self.workspace, reporter=self.reporter)
+        try:
+            self.workers = [asyncio.create_task(self._agent_loop(agent)) for agent in self.project.agents]
+            await self.hub.send(Message('__runtime__', self.state.supervisor, 'PLAN', self._context('plan')))
+            await self.finished.wait()
+            if self.error:
+                raise self.error
+            return self.project_accepted
+        finally:
+            for worker in self.workers:
+                worker.cancel()
+            await asyncio.gather(*self.workers, return_exceptions=True)
+            await asyncio.to_thread(self.workspace.stop_servers)
 
-    def _find_supervisor(self):
-        supervisors = [a for a in self.project.agents if a.template == 'Supervisor.md']
-        if len(supervisors) != 1:
-            raise ValueError('MAD projects require exactly one Supervisor.')
-        self.supervisor = supervisors[0]
-
-    def _require_supervisor(self, message):
-        if self.supervisor is None or message.sender != self.supervisor.name:
-            raise ValueError('Only the Supervisor may mutate the task plan or accept work.')
-
-    async def _runtime_loop(self):
-        handlers = {'PLAN_RESULT': self._handle_plan,
-                    'TASK_RESULT': self._handle_task_result,
-                    'REPLAN_RESULT': self._handle_replan_result,
-                    'AGENT_ERROR': self._handle_agent_error,
-                    'PROJECT_REVIEW_RESULT': self._handle_project_review_result}
+    async def _agent_loop(self, agent):
         while True:
-            message = await self.hub.receive('__runtime__')
-            handler = handlers.get(message.type)
-            if handler:
-                await handler(message)
-            if (self.state.finished(self.pending_reviews)
-                    and all(task.status in {'completed', 'cancelled'} for task in self.state.tasks)
-                    and not self.project_review_attempted):
-                await self._request_project_review()
-                continue
-            if self._project_finished():
-                self.reporter.finish(self.project.tasks)
-                break
+            event = await self.hub.receive(agent.name)
+            ui.activity(agent, event)
+            try:
+                await agent.work(self.project, event, self._actions(agent, event), self._apply)
+            except Exception as error:
+                self.workspace.record(agent.name, {'action': 'error', 'event': event.type},
+                                      {'success': False, 'result': str(error)}, event.task_id)
+                if event.type == 'TASK' and self.state.get(event.task_id).status == 'running':
+                    await self._submit(agent, event, {'status': 'blocked', 'summary': str(error), 'output': ''},
+                                       event.metadata.get('records', []))
+                elif event.type != 'PEER':
+                    self.error = error
+                    self.finished.set()
+                else:
+                    ui.error(f'Peer processing failed: {error}')
 
-    async def _handle_plan(self, message):
-        self._require_supervisor(message)
-        if self.state.planned:
-            raise ValueError('Initial task plan already installed.')
-        self.state.install_plan(parse_json_response(message.content))
-        self.reporter.plan(self.project.tasks)
-        await self._dispatch_ready_tasks()
+    async def _submit(self, agent, event, result, records):
+        tool_ids = [record['id'] for record in records]
+        self.state.submit(agent.name, event.task_id, result, tool_ids)
+        task = self.state.get(event.task_id)
+        record = self.workspace.record(agent.name, {'action': 'result', **result},
+                                       {'success': True, 'result': result}, task.id)
+        task.evidence.append(record['id'])
+        artifact = self.workspace.task_report(task)
+        self.pending_reviews.add(task.id)
+        ui.task_result(task, artifact)
+        await self.hub.send(Message('__runtime__', self.state.supervisor, 'REVIEW',
+                                   self._context('review', task, self._evidence(task.evidence)), task.id))
+        await self._schedule()
 
-    async def _handle_task_result(self, message):
-        self.review_attempts[message.task_id] = 0
-        service = ReviewService(self.state, self.workspace, self.hub, self.supervisor,
-                                self.reporter, self.pending_reviews)
-        await service.submit(message)
+    async def _apply(self, agent, step, event, reads, records):
+        action = step['action']
+        if action not in self._actions(agent, event):
+            raise ValueError('Action is not permitted for this event.')
+        if action in {'plan', 'replan'}:
+            for definition in step['tasks']:
+                for path in definition.get('artifacts', []):
+                    self.workspace.path(path)
+        if action == 'tool':
+            call = {key: value for key, value in step.items() if key != 'action'}
+            outcome = await asyncio.to_thread(self.workspace.execute, call, reads, review=event.type != 'TASK')
+            record = self.workspace.record(agent.name, step, outcome, event.task_id)
+            records.append(record)
+            ui.tool_result(agent.name, step, outcome)
+            return False, record
+        if action == 'message':
+            if step['recipient'] == agent.name:
+                raise ValueError('Do not message yourself.')
+            await self.hub.send(Message(agent.name, step['recipient'], 'PEER', step['content'],
+                                        event.task_id, {'reply': event.type == 'PEER'}))
+        elif action == 'done':
+            return True, None
+        elif action == 'plan':
+            self.state.plan(agent.name, step['tasks'], initial=True)
+            ui.plan(self.state.tasks)
+        elif action == 'result':
+            if step['status'] == 'completed':
+                self.workspace.require_artifacts(self.state.get(event.task_id).artifacts)
+            if step['status'] == 'completed' and records and not records[-1]['success']:
+                raise ValueError('Investigate or resolve the last tool failure, or report blocked.')
+            result = {key: step[key] for key in ['status', 'summary', 'output']}
+            await self._submit(agent, event, result, records)
+            return True, None
+        elif action == 'review':
+            if event.task_id not in self.pending_reviews:
+                raise ValueError('No review is pending for the current task.')
+            task = self.state.get(event.task_id)
+            evidence = self._evidence([*task.evidence, *[record['id'] for record in records]])
+            if step['verdict'] == 'accept':
+                self.workspace.require_artifacts(task.artifacts)
+            self.state.review(agent.name, task.id, step['verdict'], step['reason'], step['evidence'], evidence)
+            self.pending_reviews.remove(task.id)
+            self.workspace.task_report(task)
+            ui.review(task, 'blocked' if self.state.stop_reason else step['verdict'], task.feedback)
+        elif action == 'replan':
+            self.state.plan(agent.name, step['tasks'])
+            for definition in step['tasks']:
+                self.state.get(definition['id']).feedback = step['reason']
+            self.final_queued = False
+            if event.type == 'REVIEW':
+                task = self.state.get(event.task_id)
+                if task.status in {'review', 'blocked'}:
+                    record = self.workspace.record(agent.name, step, {'success': True, 'result': 'Plan updated.'}, event.task_id)
+                    return False, {'record': record, 'remaining': f'Decide the current task {task.id} with review.'}
+                self.pending_reviews.discard(task.id)
+        elif action == 'finish':
+            self.state.require_supervisor(agent.name)
+            if not isinstance(step['accepted'], bool) or not step['reason'].strip():
+                raise ValueError('Explicitly accept or reject the project and explain why.')
+            if step['accepted']:
+                if self.pending_reviews or any(task.status not in {'completed', 'cancelled'} for task in self.state.tasks):
+                    raise ValueError('Unresolved tasks prevent project acceptance.')
+                for task in self.state.tasks:
+                    if task.status == 'completed':
+                        self.workspace.require_artifacts(task.artifacts)
+                ids = [ref for task in self.state.tasks if task.status == 'completed' for ref in task.evidence]
+                current = [record['id'] for record in records]
+                self.state.check_evidence(step['reason'], step['evidence'], self._evidence([*ids, *current]))
+                if self.workspace.list_files() != '(directory is empty)':
+                    fresh = {record['id'] for record in records if record['success']
+                             and record['request'].get('tool') in {'read', 'run', 'browser_check'}}
+                    if not fresh.intersection(step['evidence']):
+                        raise ValueError('Inspect the current artifacts and cite fresh evidence before final approval.')
+            self.project_accepted = step['accepted']
+            record = self.workspace.record(agent.name, step, {'success': True, 'result': step['reason']})
+            (self.workspace.audit / 'project-review.json').write_text(json.dumps(record, indent=2))
+            ui.finish(self.project_accepted, step['reason'])
+            self.finished.set()
+            return True, None
+        else:
+            raise ValueError(f'Unknown action: {action}')
+        record = self.workspace.record(agent.name, step, {'success': True, 'result': 'Action applied.'}, event.task_id)
+        if action == 'message':
+            return event.type == 'PEER', record
+        if self.state.stop_reason:
+            ui.finish(False, self.state.stop_reason)
+            self.finished.set()
+        else:
+            await self._schedule()
+        return True, record
 
-    async def _handle_replan_result(self, message):
-        self._require_supervisor(message)
-        if message.task_id not in self.pending_reviews:
-            raise ValueError(f'Unexpected Supervisor decision for {message.task_id}')
-        self.pending_reviews.remove(message.task_id)
-        evidence = self.state.evidence.setdefault(message.task_id, {})
-        for record in message.metadata.get('review_evidence', []):
-            evidence[record['id']] = record
-        try:
-            data = parse_json_response(message.content)
-            self.state.decide(data.get('actions', []), message.task_id)
-        except (ValueError, KeyError, TypeError) as error:
-            self.workspace.audit_store.write_review(message.task_id, message.content, evidence, False, error)
-            self.reporter.review_rejected(error, response=message.content)
-            attempt = self.review_attempts.get(message.task_id, 0)
-            if attempt >= 1:
-                raise RuntimeError('Supervisor review remained invalid after correction; work was not accepted.') from error
-            self.review_attempts[message.task_id] = attempt + 1
-            self.pending_reviews.add(message.task_id)
-            service = ReviewService(self.state, self.workspace, self.hub, self.supervisor,
-                                    self.reporter, self.pending_reviews)
-            context = await service.context(evidence)
-            await self.hub.send(Message(
-                sender='__runtime__', recipient=self.supervisor.name, type='REPLAN_REQUEST',
-                task_id=message.task_id,
-                content=f'Your previous decision was rejected: {error}\n'
-                        f'Rejected response: {message.content}\n'
-                        f'Correct your decision for task {message.task_id}; do not claim other tasks are complete.\n'
-                        f'The task graph above is the current source of truth.\nRecorded evidence:\n{context}',
-                metadata={'event_type': 'review_correction', 'review_attempt': attempt + 1,
-                          'evidence_ids': list(evidence)},
-            ))
+    async def _schedule(self):
+        if self.finished.is_set():
             return
-        else:
-            self.workspace.audit_store.write_review(
-                message.task_id, data, evidence,
-                any(task.id == message.task_id and task.status == 'completed' for task in self.state.tasks),
-            )
-            self.task_feedback[message.task_id] = message.content
-            self.reporter.review_accepted(data.get('reason', ''))
-        await self._dispatch_ready_tasks()
-
-    async def _handle_agent_error(self, message):
-        request = message.metadata.get('request_type')
-        if request == 'TASK':
-            message.metadata['status'] = 'blocked'
-            await self._handle_task_result(message)
-        elif request in {'PLAN_REQUEST', 'REPLAN_REQUEST', 'PROJECT_REVIEW_REQUEST'}:
-            self._require_supervisor(message)
-            raise RuntimeError(f'Supervisor {request} failed: {message.content}')
-
-    async def _dispatch_ready_tasks(self):
         for task in self.state.ready():
-            self.state.start(task)
-            await self.hub.send(Message(
-                sender=self.supervisor.name, recipient=task.owner, type='TASK', task_id=task.id,
-                metadata={'task': Task.from_dict(task.to_dict()),
-                          'review_feedback': self.task_feedback.get(task.id, '')},
-            ))
-
-    async def _request_project_review(self):
-        service = ReviewService(self.state, self.workspace, self.hub, self.supervisor,
-                                self.reporter, self.pending_reviews)
-        self.project_evidence, content = await service.project_context()
-        self.project_review_pending = True
-        self.project_review_attempted = True
-        await self.hub.send(Message(
-            sender='__runtime__', recipient=self.supervisor.name,
-            type='PROJECT_REVIEW_REQUEST', content=content,
-            metadata={'event_type': 'project_review', 'evidence_ids': list(self.project_evidence)},
-        ))
-
-    async def _handle_project_review_result(self, message):
-        self._require_supervisor(message)
-        if not self.project_review_pending:
-            raise ValueError('Unexpected final project review.')
-        self.project_review_pending = False
-        for record in message.metadata.get('review_evidence', []):
-            self.project_evidence[record['id']] = record
-        try:
-            data = parse_json_response(message.content)
-            if not isinstance(data.get('accepted'), bool):
-                raise ValueError('Final review must explicitly accept or reject the project.')
-            if data['accepted']:
-                if data.get('actions'):
-                    raise ValueError('Task changes require a new final review.')
-                self.state.validate_assessments(
-                    self.project.success or [self.project.objective],
-                    data.get('assessments'), self.project_evidence,
-                )
-                # Artifact projects require fresh inspection, not only earlier claims/listings.
-                listing = self.project_evidence.get('workspace', {})
-                if not listing.get('success'):
-                    raise ValueError('Final workspace evidence is unavailable.')
-                if listing.get('result') != '(directory is empty)':
-                    fresh = {record['id'] for record in message.metadata.get('review_evidence', [])
-                             if record.get('success') and record.get('request', {}).get('tool')
-                             in {'read', 'run', 'browser_check'}}
-                    if not fresh or not all(
-                        fresh.intersection(item['evidence']) for item in data['assessments']
-                    ):
-                        raise ValueError('Final artifact review must cite fresh inspection evidence.')
-                self.project_accepted = True
-            else:
-                before = [task.to_dict() for task in self.state.tasks]
-                self.state.decide(data.get('actions', []), None)
-                for action in data.get('actions', []):
-                    if action.get('task_id'):
-                        self.task_feedback[action['task_id']] = message.content
-                # Another final review is required after corrective work.
-                if [task.to_dict() for task in self.state.tasks] != before:
-                    self.project_review_attempted = False
-        except (ValueError, KeyError, TypeError) as error:
-            self.workspace.audit_store.write_review('project', message.content,
-                                                     self.project_evidence, False, error)
-            self.reporter.review_rejected(error, response=message.content)
-            self.reporter.project_review(False, str(error))
-        else:
-            self.workspace.audit_store.write_review('project', data,
-                                                     self.project_evidence, self.project_accepted)
-            self.reporter.project_review(self.project_accepted, data.get('reason', ''))
-        await self._dispatch_ready_tasks()
-
-    def _project_finished(self):
-        return self.state.finished(self.pending_reviews) and not self.project_review_pending
-
-    async def _shutdown(self):
-        for result in await asyncio.to_thread(self.workspace.stop_servers):
-            self.reporter.print(f'[dim]{result}[/dim]')
-        for task in self.runtime_tasks:
-            task.cancel()
-        if self.runtime_tasks:
-            await asyncio.gather(*self.runtime_tasks, return_exceptions=True)
+            self.state.start(task.id)
+            await self.hub.send(Message(self.state.supervisor, task.owner, 'TASK',
+                                       self._context('task', task), task.id))
+        if not self.state.planned or self.pending_reviews or any(task.status == 'running' for task in self.state.tasks):
+            return
+        if any(task.status in {'pending', 'blocked'} for task in self.state.tasks):
+            ui.finish(False, 'Blocked or unrunnable tasks remain.')
+            self.finished.set()
+        elif not self.final_queued:
+            self.final_queued = True
+            ids = [ref for task in self.state.tasks for ref in task.evidence]
+            await self.hub.send(Message('__runtime__', self.state.supervisor, 'PROJECT',
+                                       self._context('project_ready', records=self._evidence(ids))))
