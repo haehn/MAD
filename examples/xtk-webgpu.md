@@ -17,7 +17,7 @@ SUCCESS:
 - Performance is evaluated for obvious regressions.
 
 AGENTS:
-- Director who plans the full conversion and supervises all other agents (Director.md:Qwen/Qwen3-8B)
+- Supervisor who plans the full conversion and supervises all other agents (Supervisor.md:Qwen/Qwen3-8B)
 - Software Architect who designs the WebGPU architecture and migration strategy (Architect.md:Qwen/Qwen3-8B)
 - Researcher who studies the current XTK implementation, WebGPU requirements, and relevant migration approaches (Researcher.md:Qwen/Qwen3-8B)
 - Rendering Coder who converts rendering, shaders, interaction, camera, and GPU resource management to WebGPU (Coder.md:Qwen/Qwen3-8B)

@@ -1,1309 +1,255 @@
+"""Compose MAD services and orchestrate project messages and task scheduling."""
 import asyncio
-import copy
-import json
-import re
-
 from mad.agent_runtime import AgentRuntime
 from mad.llm import LLM
 from mad.message import Message
 from mad.message_hub import MessageHub
+from mad.protocol import parse_json_response
+from mad.review_service import ReviewService
+from mad.project_state import ProjectState
+from mad.reporter import Reporter
 from mad.task import Task
 from mad.workspace import Workspace
-from mad.ui import (
-    console,
-    print_banner,
-    print_project,
-)
-
-
-def parse_json_response(response):
-    response = response.strip()
-
-    response = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        response,
-        flags=re.IGNORECASE,
-    )
-
-    response = re.sub(
-        r"\s*```$",
-        "",
-        response,
-    )
-
-    return json.loads(
-        response
-    )
 
 
 class Runtime:
-    def __init__(
-        self,
-        project,
-        server="http://localhost:8000/v1",
-        show_thinking=False,
-        verbose=False,
-    ):
+    def __init__(self, project, server='http://localhost:8000/v1',
+                 show_thinking=False, verbose=False, model_factory=None,
+                 reporter=None, workspace=None):
         self.project = project
         self.server = server
         self.show_thinking = show_thinking
         self.verbose = verbose
-
-        self.workspace = Workspace(
-            project.workspace
-        )
-
+        self.workspace = workspace if workspace is not None else Workspace(project.workspace)
+        self.reporter = reporter if reporter is not None else Reporter()
+        self.model_factory = model_factory or (lambda agent: LLM(
+            base_url=server, show_thinking=show_thinking))
+        self.state = ProjectState(project)
         self.hub = MessageHub()
-
         self.agent_runtimes = {}
         self.runtime_tasks = []
+        self.pending_reviews = set()
+        self.supervisor = None
+        self.project_accepted = False
+        self.project_review_pending = False
+        self.project_review_attempted = False
+        self.project_evidence = {}
+        self.task_feedback = {}
+        self.review_attempts = {}
 
-        self.running_tasks = set()
-        self.completed_tasks = set()
+    @property
+    def running_tasks(self):
+        return self.state.running
 
-        self.pending_replans = 0
+    @property
+    def completed_tasks(self):
+        return self.state.completed
 
-        self.director = None
+    @property
+    def pending_replans(self):
+        return len(self.pending_reviews)
 
     async def run(self):
+        self._find_supervisor()
         self._initialize_agents()
-
-        print_banner()
-
-        print_project(
-            self.project,
-            verbose=self.verbose,
-        )
-
-        console.print(
-            f"[dim]"
-            f"Workspace: {self.workspace.root}"
-            f"[/dim]"
-        )
-
-        console.print()
-
-        self._find_director()
-
-        for runtime in self.agent_runtimes.values():
-            self.runtime_tasks.append(
-                asyncio.create_task(
-                    runtime.run()
-                )
-            )
-
-        await self.hub.send(
-            Message(
-                sender="__runtime__",
-                recipient=self.director.name,
-                type="PLAN_REQUEST",
-                metadata={
-                    "agents": [
-                        agent.name
-                        for agent
-                        in self.project.agents
-                    ],
-                },
-            )
-        )
-
+        self.reporter.start(self.project, self.workspace.root, self.verbose)
         try:
+            self.runtime_tasks = [asyncio.create_task(runtime.run())
+                                  for runtime in self.agent_runtimes.values()]
+            await self.hub.send(Message(
+                sender='__runtime__', recipient=self.supervisor.name, type='PLAN_REQUEST',
+                metadata={'agents': [agent.name for agent in self.project.agents]},
+            ))
             await self._runtime_loop()
-
         finally:
             await self._shutdown()
 
-    #
-    # Initialization
-    #
-
     def _initialize_agents(self):
-        self.hub.register(
-            "__runtime__"
-        )
-
+        names = [agent.name for agent in self.project.agents]
+        if len(names) != len(set(names)) or '__runtime__' in names:
+            raise ValueError('Agent names must be unique and cannot be __runtime__.')
+        self.hub.register('__runtime__')
         for agent in self.project.agents:
-            self.hub.register(
-                agent.name
-            )
-
-            agent.server = LLM(
-                base_url=self.server,
-                show_thinking=self.show_thinking,
-            )
-
+            self.hub.register(agent.name)
+            agent.server = self.model_factory(agent)
             agent.message_hub = self.hub
+            self.agent_runtimes[agent.name] = AgentRuntime(
+                agent, self.project, self.hub, self.workspace, reporter=self.reporter)
 
-            self.agent_runtimes[
-                agent.name
-            ] = AgentRuntime(
-                agent=agent,
-                project=self.project,
-                hub=self.hub,
-                workspace=self.workspace,
-            )
+    def _find_supervisor(self):
+        supervisors = [a for a in self.project.agents if a.template == 'Supervisor.md']
+        if len(supervisors) != 1:
+            raise ValueError('MAD projects require exactly one Supervisor.')
+        self.supervisor = supervisors[0]
 
-    def _find_director(self):
-        directors = [
-            agent
-            for agent in self.project.agents
-            if agent.template == "Director.md"
-        ]
-
-        if len(directors) != 1:
-            raise ValueError(
-                "MAD projects require exactly one Director."
-            )
-
-        self.director = directors[
-            0
-        ]
-
-    #
-    # Runtime loop
-    #
+    def _require_supervisor(self, message):
+        if self.supervisor is None or message.sender != self.supervisor.name:
+            raise ValueError('Only the Supervisor may mutate the task plan or accept work.')
 
     async def _runtime_loop(self):
+        handlers = {'PLAN_RESULT': self._handle_plan,
+                    'TASK_RESULT': self._handle_task_result,
+                    'REPLAN_RESULT': self._handle_replan_result,
+                    'AGENT_ERROR': self._handle_agent_error,
+                    'PROJECT_REVIEW_RESULT': self._handle_project_review_result}
         while True:
-            message = await self.hub.receive(
-                "__runtime__"
-            )
-
-            if message.type == "PLAN_RESULT":
-                await self._handle_plan(
-                    message
-                )
-
-            elif message.type == "TASK_RESULT":
-                await self._handle_task_result(
-                    message
-                )
-
-            elif message.type == "REPLAN_RESULT":
-                await self._handle_replan_result(
-                    message
-                )
-
+            message = await self.hub.receive('__runtime__')
+            handler = handlers.get(message.type)
+            if handler:
+                await handler(message)
+            if (self.state.finished(self.pending_reviews)
+                    and all(task.status in {'completed', 'cancelled'} for task in self.state.tasks)
+                    and not self.project_review_attempted):
+                await self._request_project_review()
+                continue
             if self._project_finished():
+                self.reporter.finish(self.project.tasks)
                 break
 
-    #
-    # Initial plan
-    #
-
-    async def _handle_plan(
-        self,
-        message,
-    ):
-        data = parse_json_response(
-            message.content
-        )
-
-        self.project.tasks = [
-            Task.from_dict(
-                task_data
-            )
-            for task_data
-            in data["tasks"]
-        ]
-
-        self._validate_tasks(
-            self.project.tasks
-        )
-
-        console.print()
-        console.print(
-            "[bold cyan]"
-            "Initial Task Graph"
-            "[/bold cyan]"
-        )
-
-        for task in self.project.tasks:
-            console.print(
-                f"  [yellow]{task.id}[/yellow] "
-                f"{task.title} "
-                f"[dim]→ {task.owner}[/dim]"
-            )
-
-        console.print()
-
+    async def _handle_plan(self, message):
+        self._require_supervisor(message)
+        if self.state.planned:
+            raise ValueError('Initial task plan already installed.')
+        self.state.install_plan(parse_json_response(message.content))
+        self.reporter.plan(self.project.tasks)
         await self._dispatch_ready_tasks()
 
-    #
-    # Worker result
-    #
+    async def _handle_task_result(self, message):
+        self.review_attempts[message.task_id] = 0
+        service = ReviewService(self.state, self.workspace, self.hub, self.supervisor,
+                                self.reporter, self.pending_reviews)
+        await service.submit(message)
 
-    async def _handle_task_result(
-        self,
-        message,
-    ):
-        task = self._get_task(
-            message.task_id
-        )
-
-        self.running_tasks.discard(
-            task.id
-        )
-
-        proposed_status = message.metadata.get(
-            "status",
-            "blocked",
-        )
-
-        elapsed = message.metadata.get(
-            "elapsed"
-        )
-
-        output = message.metadata.get(
-            "output",
-            "",
-        )
-
-        changed_files = message.metadata.get(
-            "changed_files",
-            [],
-        )
-
-        browser_checks = message.metadata.get(
-            "browser_checks",
-            [],
-        )
-
-        command_results = message.metadata.get(
-            "command_results",
-            [],
-        )
-
-        summary = (
-            message.content
-            or ""
-        )
-
-        #
-        # Worker success does NOT mean completed.
-        #
-
-        if proposed_status == "completed":
-            task.status = "review"
-
-            timing = (
-                f" in {elapsed:.1f}s"
-                if elapsed is not None
-                else ""
-            )
-
-            console.print(
-                f"[bold yellow]"
-                f"◇ {task.id} ready for review"
-                f"[/bold yellow] "
-                f"{task.title} "
-                f"[dim]"
-                f"({message.sender}{timing})"
-                f"[/dim]"
-            )
-
-            audit_status = "review"
-
-        else:
-            task.status = "blocked"
-
-            timing = (
-                f" after {elapsed:.1f}s"
-                if elapsed is not None
-                else ""
-            )
-
-            console.print(
-                f"[bold red]"
-                f"✗ {task.id} blocked"
-                f"[/bold red] "
-                f"[dim]"
-                f"({message.sender}{timing})"
-                f"[/dim]"
-            )
-
-            audit_status = "blocked"
-
-        artifact_path = (
-            self.workspace.write_task_result(
-                task=task,
-                agent_name=message.sender,
-                status=audit_status,
-                summary=summary,
-                output=output,
-            )
-        )
-
-        console.print(
-            f"[dim]"
-            f"↳ audit: {artifact_path}"
-            f"[/dim]"
-        )
-
-        if summary:
-            console.print()
-            console.print(
-                f"[bold cyan]"
-                f"{message.sender}"
-                f"[/bold cyan]"
-            )
-            console.print(
-                summary
-            )
-            console.print()
-
-        if output:
-            console.print(
-                f"[bold white]"
-                f"{message.sender} result"
-                f"[/bold white]"
-            )
-            console.print(
-                output
-            )
-            console.print()
-
-        #
-        # Runtime supplies Director with independent
-        # workspace evidence.
-        #
-
+    async def _handle_replan_result(self, message):
+        self._require_supervisor(message)
+        if message.task_id not in self.pending_reviews:
+            raise ValueError(f'Unexpected Supervisor decision for {message.task_id}')
+        self.pending_reviews.remove(message.task_id)
+        evidence = self.state.evidence.setdefault(message.task_id, {})
+        for record in message.metadata.get('review_evidence', []):
+            evidence[record['id']] = record
         try:
-            workspace_snapshot = await asyncio.to_thread(
-                self.workspace.list_files,
-                ".",
-            )
-
-        except Exception as error:
-            workspace_snapshot = (
-                f"[workspace listing failed: {error}]"
-            )
-
-        evidence = [
-            f"TASK: {task.id} — {task.title}",
-            f"WORKER: {message.sender}",
-            f"WORKER CLAIMED STATUS: {proposed_status}",
-            "",
-            "ACCEPTANCE CRITERIA:",
-        ]
-
-        if task.acceptance:
-            evidence.extend(
-                f"- {item}"
-                for item in task.acceptance
-            )
-
+            data = parse_json_response(message.content)
+            self.state.decide(data.get('actions', []), message.task_id)
+        except (ValueError, KeyError, TypeError) as error:
+            self.workspace.audit_store.write_review(message.task_id, message.content, evidence, False, error)
+            self.reporter.review_rejected(error, response=message.content)
+            attempt = self.review_attempts.get(message.task_id, 0)
+            if attempt >= 1:
+                raise RuntimeError('Supervisor review remained invalid after correction; work was not accepted.') from error
+            self.review_attempts[message.task_id] = attempt + 1
+            self.pending_reviews.add(message.task_id)
+            service = ReviewService(self.state, self.workspace, self.hub, self.supervisor,
+                                    self.reporter, self.pending_reviews)
+            context = await service.context(evidence)
+            await self.hub.send(Message(
+                sender='__runtime__', recipient=self.supervisor.name, type='REPLAN_REQUEST',
+                task_id=message.task_id,
+                content=f'Your previous decision was rejected: {error}\n'
+                        f'Rejected response: {message.content}\n'
+                        f'Correct your decision for task {message.task_id}; do not claim other tasks are complete.\n'
+                        f'The task graph above is the current source of truth.\nRecorded evidence:\n{context}',
+                metadata={'event_type': 'review_correction', 'review_attempt': attempt + 1,
+                          'evidence_ids': list(evidence)},
+            ))
+            return
         else:
-            evidence.append(
-                "(none)"
+            self.workspace.audit_store.write_review(
+                message.task_id, data, evidence,
+                any(task.id == message.task_id and task.status == 'completed' for task in self.state.tasks),
             )
-
-        evidence.extend(
-            [
-                "",
-                "WORKER SUMMARY:",
-                summary or "(none)",
-                "",
-                "WORKER OUTPUT:",
-                output or "(none)",
-                "",
-                "FILES CHANGED BY THIS TASK:",
-            ]
-        )
-
-        if changed_files:
-            evidence.extend(
-                f"- {path}"
-                for path in changed_files
-            )
-
-        else:
-            evidence.append(
-                "(none recorded)"
-            )
-
-        evidence.extend(
-            [
-                "",
-                "CURRENT WORKSPACE SNAPSHOT:",
-                workspace_snapshot,
-            ]
-        )
-
-        if browser_checks:
-            evidence.extend(
-                [
-                    "",
-                    "BROWSER CHECKS:",
-                ]
-            )
-
-            for check in browser_checks:
-                evidence.extend(
-                    [
-                        "---",
-                        check,
-                    ]
-                )
-
-        if command_results:
-            evidence.extend(
-                [
-                    "",
-                    "COMMAND RESULTS:",
-                ]
-            )
-
-            for result in command_results[-5:]:
-                evidence.extend(
-                    [
-                        "---",
-                        result,
-                    ]
-                )
-
-        evidence.extend(
-            [
-                "",
-                f"AUDIT RECORD: {artifact_path}",
-            ]
-        )
-
-        self.pending_replans += 1
-
-        await self.hub.send(
-            Message(
-                sender=message.sender,
-                recipient=self.director.name,
-                type="REPLAN_REQUEST",
-                task_id=task.id,
-                content="\n".join(
-                    evidence
-                ),
-                metadata={
-                    "event_type": (
-                        "task_review"
-                        if proposed_status == "completed"
-                        else "blocker"
-                    ),
-                    "status": task.status,
-                    "artifact": str(
-                        artifact_path
-                    ),
-                },
-            )
-        )
-
-    #
-    # Director result
-    #
-
-    async def _handle_replan_result(
-        self,
-        message,
-    ):
-        if self.pending_replans > 0:
-            self.pending_replans -= 1
-
-        data = parse_json_response(
-            message.content
-        )
-
-        reason = data.get(
-            "reason",
-            "",
-        )
-
-        actions = data.get(
-            "actions",
-            [],
-        )
-
-        console.print()
-        console.print(
-            "[bold magenta]"
-            "Director Review"
-            "[/bold magenta]"
-        )
-
-        if reason:
-            console.print(
-                f"[dim]{reason}[/dim]"
-            )
-
-        reviewed_task = self._find_task(
-            message.task_id
-        )
-
-        #
-        # A review task may NOT silently pass with no action.
-        #
-
-        if (
-            reviewed_task
-            and reviewed_task.status == "review"
-            and not actions
-        ):
-            console.print(
-                "[yellow]"
-                "⚠ Director did not explicitly accept "
-                "the reviewed task. Reopening it."
-                "[/yellow]"
-            )
-
-            reviewed_task.status = "pending"
-
-            await self._dispatch_ready_tasks()
-            return
-
-        if not actions:
-            console.print(
-                "[dim]"
-                "No task graph changes."
-                "[/dim]"
-            )
-
-            await self._dispatch_ready_tasks()
-            return
-
-        proposed_tasks = copy.deepcopy(
-            self.project.tasks
-        )
-
-        valid = self._apply_replan_actions(
-            actions,
-            proposed_tasks,
-        )
-
-        if not valid:
-            console.print(
-                "[bold yellow]"
-                "⚠ Replan rejected. "
-                "Existing task graph unchanged."
-                "[/bold yellow]"
-            )
-
-            #
-            # Don't strand review tasks.
-            #
-
-            if (
-                reviewed_task
-                and reviewed_task.status == "review"
-            ):
-                reviewed_task.status = "pending"
-
-            await self._dispatch_ready_tasks()
-            return
-
-        try:
-            self._validate_tasks(
-                proposed_tasks
-            )
-
-        except ValueError as error:
-            console.print(
-                "[bold yellow]"
-                f"⚠ Replan rejected: {error}"
-                "[/bold yellow]"
-            )
-
-            if (
-                reviewed_task
-                and reviewed_task.status == "review"
-            ):
-                reviewed_task.status = "pending"
-
-            await self._dispatch_ready_tasks()
-            return
-
-        self.project.tasks = (
-            proposed_tasks
-        )
-
-        self._synchronize_completed_tasks()
-
-        console.print(
-            "[green]"
-            "✓ Director decision accepted"
-            "[/green]"
-        )
-
+            self.task_feedback[message.task_id] = message.content
+            self.reporter.review_accepted(data.get('reason', ''))
         await self._dispatch_ready_tasks()
 
-    #
-    # Replan actions
-    #
+    async def _handle_agent_error(self, message):
+        request = message.metadata.get('request_type')
+        if request == 'TASK':
+            message.metadata['status'] = 'blocked'
+            await self._handle_task_result(message)
+        elif request in {'PLAN_REQUEST', 'REPLAN_REQUEST', 'PROJECT_REVIEW_REQUEST'}:
+            self._require_supervisor(message)
+            raise RuntimeError(f'Supervisor {request} failed: {message.content}')
 
-    def _apply_replan_actions(
-        self,
-        actions,
-        tasks,
-    ):
-        planned_add_ids = set()
+    async def _dispatch_ready_tasks(self):
+        for task in self.state.ready():
+            self.state.start(task)
+            await self.hub.send(Message(
+                sender=self.supervisor.name, recipient=task.owner, type='TASK', task_id=task.id,
+                metadata={'task': Task.from_dict(task.to_dict()),
+                          'review_feedback': self.task_feedback.get(task.id, '')},
+            ))
 
-        for action in actions:
-            if action.get(
-                "type"
-            ) != "add":
-                continue
+    async def _request_project_review(self):
+        service = ReviewService(self.state, self.workspace, self.hub, self.supervisor,
+                                self.reporter, self.pending_reviews)
+        self.project_evidence, content = await service.project_context()
+        self.project_review_pending = True
+        self.project_review_attempted = True
+        await self.hub.send(Message(
+            sender='__runtime__', recipient=self.supervisor.name,
+            type='PROJECT_REVIEW_REQUEST', content=content,
+            metadata={'event_type': 'project_review', 'evidence_ids': list(self.project_evidence)},
+        ))
 
-            task_data = action.get(
-                "task"
-            )
-
-            if not task_data:
-                console.print(
-                    "[yellow]"
-                    "⚠ Director ADD missing complete task."
-                    "[/yellow]"
-                )
-                return False
-
-            task_id = task_data.get(
-                "id"
-            )
-
-            if not task_id:
-                console.print(
-                    "[yellow]"
-                    "⚠ Director ADD task missing ID."
-                    "[/yellow]"
-                )
-                return False
-
-            planned_add_ids.add(
-                task_id
-            )
-
-        for action in actions:
-            if not self._apply_replan_action(
-                action,
-                tasks,
-                planned_add_ids,
-            ):
-                return False
-
-        return True
-
-    def _apply_replan_action(
-        self,
-        action,
-        tasks,
-        planned_add_ids,
-    ):
-        action_type = action.get(
-            "type"
-        )
-
-        if action_type == "accept":
-            return self._action_accept(
-                action,
-                tasks,
-            )
-
-        if action_type == "add":
-            return self._action_add(
-                action,
-                tasks,
-            )
-
-        if action_type == "revise":
-            return self._action_revise(
-                action,
-                tasks,
-                planned_add_ids,
-            )
-
-        if action_type == "reassign":
-            return self._action_reassign(
-                action,
-                tasks,
-            )
-
-        if action_type == "cancel":
-            return self._action_cancel(
-                action,
-                tasks,
-            )
-
-        if action_type == "reopen":
-            return self._action_reopen(
-                action,
-                tasks,
-            )
-
-        console.print(
-            f"[yellow]"
-            f"⚠ Unknown replan action "
-            f"{action_type!r}"
-            f"[/yellow]"
-        )
-
-        return False
-
-    #
-    # ACCEPT
-    #
-
-    def _action_accept(
-        self,
-        action,
-        tasks,
-    ):
-        task_id = action.get(
-            "task_id"
-        )
-
-        task = self._find_task_in(
-            tasks,
-            task_id,
-        )
-
-        if not task:
-            console.print(
-                f"[yellow]"
-                f"⚠ Cannot accept unknown task "
-                f"{task_id!r}"
-                f"[/yellow]"
-            )
-            return False
-
-        if task.status != "review":
-            console.print(
-                f"[yellow]"
-                f"⚠ Cannot accept {task.id}: "
-                f"status is {task.status!r}, "
-                f"expected 'review'"
-                f"[/yellow]"
-            )
-            return False
-
-        task.status = "completed"
-
-        console.print(
-            f"[bold green]"
-            f"✓ {task.id} accepted"
-            f"[/bold green]"
-        )
-
-        return True
-
-    #
-    # ADD
-    #
-
-    def _action_add(
-        self,
-        action,
-        tasks,
-    ):
-        task_data = action.get(
-            "task"
-        )
-
-        if not task_data:
-            return False
-
+    async def _handle_project_review_result(self, message):
+        self._require_supervisor(message)
+        if not self.project_review_pending:
+            raise ValueError('Unexpected final project review.')
+        self.project_review_pending = False
+        for record in message.metadata.get('review_evidence', []):
+            self.project_evidence[record['id']] = record
         try:
-            task = Task.from_dict(
-                task_data
-            )
-
-        except Exception as error:
-            console.print(
-                f"[yellow]"
-                f"⚠ Invalid ADD task: {error}"
-                f"[/yellow]"
-            )
-            return False
-
-        if self._find_task_in(
-            tasks,
-            task.id,
-        ):
-            console.print(
-                f"[yellow]"
-                f"⚠ Task already exists: "
-                f"{task.id}"
-                f"[/yellow]"
-            )
-            return False
-
-        tasks.append(
-            task
-        )
-
-        console.print(
-            f"[green]+[/green] "
-            f"{task.id} "
-            f"{task.title} "
-            f"[dim]→ {task.owner}[/dim]"
-        )
-
-        return True
-
-    #
-    # REVISE
-    #
-
-    def _action_revise(
-        self,
-        action,
-        tasks,
-        planned_add_ids,
-    ):
-        task_id = action.get(
-            "task_id"
-        )
-
-        task = self._find_task_in(
-            tasks,
-            task_id,
-        )
-
-        if not task:
-            console.print(
-                f"[yellow]"
-                f"⚠ Cannot revise unknown task "
-                f"{task_id!r}"
-                f"[/yellow]"
-            )
-            return False
-
-        if task.status == "running":
-            console.print(
-                f"[yellow]"
-                f"⚠ Cannot revise running task "
-                f"{task_id}"
-                f"[/yellow]"
-            )
-            return False
-
-        updates = action.get(
-            "updates",
-            {},
-        )
-
-        if "dependencies" in updates:
-            existing = {
-                item.id
-                for item in tasks
-            }
-
-            allowed = (
-                existing
-                | planned_add_ids
-            )
-
-            for dependency in updates[
-                "dependencies"
-            ]:
-                if dependency not in allowed:
-                    console.print(
-                        f"[yellow]"
-                        f"⚠ {task_id} references unknown "
-                        f"dependency {dependency!r}"
-                        f"[/yellow]"
-                    )
-                    return False
-
-        for field in [
-            "title",
-            "description",
-            "owner",
-            "dependencies",
-            "acceptance",
-        ]:
-            if field in updates:
-                setattr(
-                    task,
-                    field,
-                    updates[field],
+            data = parse_json_response(message.content)
+            if not isinstance(data.get('accepted'), bool):
+                raise ValueError('Final review must explicitly accept or reject the project.')
+            if data['accepted']:
+                if data.get('actions'):
+                    raise ValueError('Task changes require a new final review.')
+                self.state.validate_assessments(
+                    self.project.success or [self.project.objective],
+                    data.get('assessments'), self.project_evidence,
                 )
-
-        task.status = "pending"
-
-        console.print(
-            f"[yellow]~[/yellow] "
-            f"{task.id} revised"
-        )
-
-        return True
-
-    #
-    # REASSIGN
-    #
-
-    def _action_reassign(
-        self,
-        action,
-        tasks,
-    ):
-        task_id = action.get(
-            "task_id"
-        )
-
-        owner = action.get(
-            "owner"
-        )
-
-        task = self._find_task_in(
-            tasks,
-            task_id,
-        )
-
-        if not task:
-            return False
-
-        if not owner:
-            console.print(
-                f"[yellow]"
-                f"⚠ Invalid reassignment of "
-                f"{task_id}: missing owner"
-                f"[/yellow]"
-            )
-            return False
-
-        valid_agents = {
-            agent.name
-            for agent in self.project.agents
-        }
-
-        if owner not in valid_agents:
-            console.print(
-                f"[yellow]"
-                f"⚠ Unknown agent {owner!r}"
-                f"[/yellow]"
-            )
-            return False
-
-        if task.status == "running":
-            return False
-
-        if task.owner == owner:
-            console.print(
-                f"[yellow]"
-                f"⚠ {task.id} already belongs "
-                f"to {owner}"
-                f"[/yellow]"
-            )
-            return False
-
-        task.owner = owner
-        task.status = "pending"
-
-        console.print(
-            f"[yellow]→[/yellow] "
-            f"{task.id} reassigned "
-            f"to {owner}"
-        )
-
-        return True
-
-    #
-    # CANCEL
-    #
-
-    def _action_cancel(
-        self,
-        action,
-        tasks,
-    ):
-        task_id = action.get(
-            "task_id"
-        )
-
-        task = self._find_task_in(
-            tasks,
-            task_id,
-        )
-
-        if not task:
-            return False
-
-        if task.status == "running":
-            return False
-
-        task.status = "cancelled"
-
-        console.print(
-            f"[red]×[/red] "
-            f"{task.id} cancelled"
-        )
-
-        return True
-
-    #
-    # REOPEN
-    #
-
-    def _action_reopen(
-        self,
-        action,
-        tasks,
-    ):
-        task_id = action.get(
-            "task_id"
-        )
-
-        task = self._find_task_in(
-            tasks,
-            task_id,
-        )
-
-        if not task:
-            return False
-
-        if task.status == "running":
-            return False
-
-        task.status = "pending"
-
-        console.print(
-            f"[yellow]↻[/yellow] "
-            f"{task.id} reopened"
-        )
-
-        return True
-
-    #
-    # Scheduler
-    #
-
-    async def _dispatch_ready_tasks(
-        self,
-    ):
-        for task in self.project.tasks:
-            if task.status != "pending":
-                continue
-
-            dependencies_complete = all(
-                dependency
-                in self.completed_tasks
-                for dependency
-                in task.dependencies
-            )
-
-            if not dependencies_complete:
-                continue
-
-            task.status = "running"
-
-            self.running_tasks.add(
-                task.id
-            )
-
-            await self.hub.send(
-                Message(
-                    sender=self.director.name,
-                    recipient=task.owner,
-                    type="TASK",
-                    task_id=task.id,
-                    metadata={
-                        "task": task,
-                    },
-                )
-            )
-
-    #
-    # Validation
-    #
-
-    def _validate_tasks(
-        self,
-        tasks,
-    ):
-        agent_names = {
-            agent.name
-            for agent in self.project.agents
-        }
-
-        task_ids = [
-            task.id
-            for task in tasks
-        ]
-
-        if len(task_ids) != len(
-            set(task_ids)
-        ):
-            raise ValueError(
-                "Duplicate task IDs."
-            )
-
-        task_id_set = set(
-            task_ids
-        )
-
-        for task in tasks:
-            if task.owner not in agent_names:
-                raise ValueError(
-                    f"{task.id} has invalid owner "
-                    f"{task.owner!r}"
-                )
-
-            for dependency in task.dependencies:
-                if dependency not in task_id_set:
-                    raise ValueError(
-                        f"{task.id} has unknown dependency "
-                        f"{dependency!r}"
-                    )
-
-                if dependency == task.id:
-                    raise ValueError(
-                        f"{task.id} depends on itself."
-                    )
-
-    def _synchronize_completed_tasks(
-        self,
-    ):
-        self.completed_tasks = {
-            task.id
-            for task in self.project.tasks
-            if task.status == "completed"
-        }
-
-    #
-    # Helpers
-    #
-
-    def _find_task_in(
-        self,
-        tasks,
-        task_id,
-    ):
-        for task in tasks:
-            if task.id == task_id:
-                return task
-
-        return None
-
-    def _find_task(
-        self,
-        task_id,
-    ):
-        return self._find_task_in(
-            self.project.tasks,
-            task_id,
-        )
-
-    def _get_task(
-        self,
-        task_id,
-    ):
-        task = self._find_task(
-            task_id
-        )
-
-        if task is None:
-            raise ValueError(
-                f"Unknown task: {task_id}"
-            )
-
-        return task
-
-    #
-    # Completion
-    #
-
-    def _project_finished(
-        self,
-    ):
-        if not hasattr(
-            self.project,
-            "tasks",
-        ):
-            return False
-
-        if self.running_tasks:
-            return False
-
-        if self.pending_replans:
-            return False
-
-        #
-        # Anything under Director review means
-        # the project is definitely not finished.
-        #
-
-        if any(
-            task.status == "review"
-            for task in self.project.tasks
-        ):
-            return False
-
-        pending = [
-            task
-            for task in self.project.tasks
-            if task.status == "pending"
-        ]
-
-        if pending:
-            ready = [
-                task
-                for task in pending
-                if all(
-                    dependency
-                    in self.completed_tasks
-                    for dependency
-                    in task.dependencies
-                )
-            ]
-
-            if ready:
-                return False
-
-            console.print()
-            console.print(
-                "[yellow]"
-                "No runnable tasks remain. "
-                "The project may be blocked."
-                "[/yellow]"
-            )
-
-            return True
-
-        blocked = [
-            task
-            for task in self.project.tasks
-            if task.status == "blocked"
-        ]
-
-        if blocked:
-            console.print()
-            console.print(
-                "[yellow]"
-                f"Project ended with "
-                f"{len(blocked)} blocked task(s)."
-                "[/yellow]"
-            )
-
-        return True
-
-    #
-    # Shutdown
-    #
-
-    async def _shutdown(
-        self,
-    ):
-        for result in self.workspace.stop_servers():
-            console.print(
-                f"[dim]{result}[/dim]"
-            )
-
-        for agent in self.project.agents:
-            await self.hub.send(
-                Message(
-                    sender="__runtime__",
-                    recipient=agent.name,
-                    type="STOP",
-                )
-            )
-
+                # Artifact projects require fresh inspection, not only earlier claims/listings.
+                listing = self.project_evidence.get('workspace', {})
+                if not listing.get('success'):
+                    raise ValueError('Final workspace evidence is unavailable.')
+                if listing.get('result') != '(directory is empty)':
+                    fresh = {record['id'] for record in message.metadata.get('review_evidence', [])
+                             if record.get('success') and record.get('request', {}).get('tool')
+                             in {'read', 'run', 'browser_check'}}
+                    if not fresh or not all(
+                        fresh.intersection(item['evidence']) for item in data['assessments']
+                    ):
+                        raise ValueError('Final artifact review must cite fresh inspection evidence.')
+                self.project_accepted = True
+            else:
+                before = [task.to_dict() for task in self.state.tasks]
+                self.state.decide(data.get('actions', []), None)
+                for action in data.get('actions', []):
+                    if action.get('task_id'):
+                        self.task_feedback[action['task_id']] = message.content
+                # Another final review is required after corrective work.
+                if [task.to_dict() for task in self.state.tasks] != before:
+                    self.project_review_attempted = False
+        except (ValueError, KeyError, TypeError) as error:
+            self.workspace.audit_store.write_review('project', message.content,
+                                                     self.project_evidence, False, error)
+            self.reporter.review_rejected(error, response=message.content)
+            self.reporter.project_review(False, str(error))
+        else:
+            self.workspace.audit_store.write_review('project', data,
+                                                     self.project_evidence, self.project_accepted)
+            self.reporter.project_review(self.project_accepted, data.get('reason', ''))
+        await self._dispatch_ready_tasks()
+
+    def _project_finished(self):
+        return self.state.finished(self.pending_reviews) and not self.project_review_pending
+
+    async def _shutdown(self):
+        for result in await asyncio.to_thread(self.workspace.stop_servers):
+            self.reporter.print(f'[dim]{result}[/dim]')
+        for task in self.runtime_tasks:
+            task.cancel()
         if self.runtime_tasks:
-            await asyncio.gather(
-                *self.runtime_tasks,
-                return_exceptions=True,
-            )
+            await asyncio.gather(*self.runtime_tasks, return_exceptions=True)

@@ -1,5 +1,6 @@
 ---
 skills:
+  - external/karpathy
   - core/planning
   - core/task-decomposition
   - core/risk-analysis

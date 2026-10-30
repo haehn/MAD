@@ -64,7 +64,7 @@ class LLM:
                 detail = response.text
 
             raise RuntimeError(
-                f"vLLM request failed "
+                f"Model server request failed "
                 f"({response.status_code}): "
                 f"{detail}"
             )

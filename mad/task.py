@@ -61,6 +61,10 @@ class Task:
             ),
         )
 
+    @property
+    def review_criteria(self):
+        return self.acceptance or [self.description or self.title]
+
     def to_dict(self):
         return {
             "id": self.id,

@@ -22,7 +22,7 @@ SUCCESS:
 - A leaderboard ranks users.
 
 AGENTS:
-- Director who supervises the project (Director.md:Qwen/Qwen3-8B)
+- Supervisor who supervises the project (Supervisor.md:Qwen/Qwen3-8B)
 - Backend Coder who implements the API (Coder.md:Qwen/Qwen3-8B)
 - Frontend Coder who implements the UI (Coder.md:Qwen/Qwen3-8B)
 - Quality Control who verifies the result (SoftwareTester.md:Qwen/Qwen3-8B)
@@ -56,3 +56,16 @@ Model = the intelligence backing the agent
 ```
 
 MAD is designed to support software development, research, analysis, writing, and other multi-agent projects.
+
+## Architecture and tests
+
+The Supervisor reviews recorded evidence against task criteria before accepting
+work. A separate final review assesses the current combined result against the
+project's success criteria. Evidence may be substantive text, source material,
+files, calculations, observations, or tool results, depending on the project.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for component boundaries and the Supervisor review protocol.
+
+```bash
+python -m unittest discover -s tests -v
+```

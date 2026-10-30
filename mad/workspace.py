@@ -1,4 +1,6 @@
 from pathlib import Path
+from mad.audit_store import AuditStore
+from mad.tool_result import ToolResult
 import contextlib
 import http.server
 import re
@@ -37,6 +39,7 @@ class Workspace:
             exist_ok=True,
         )
 
+        self.audit_store = AuditStore(self.root)
         self.servers = {}
 
     #
@@ -235,6 +238,7 @@ class Workspace:
         self,
         command,
         timeout=120,
+        structured=False,
     ):
         arguments = shlex.split(
             command
@@ -286,6 +290,8 @@ class Workspace:
                 + "\n\n[output truncated]"
             )
 
+        if structured:
+            return ToolResult(result.returncode == 0, text)
         return text
 
     #
@@ -419,6 +425,7 @@ class Workspace:
         self,
         relative_path="index.html",
         wait_ms=1500,
+        structured=False,
     ):
         target = self._resolve_agent_path(
             relative_path
@@ -627,9 +634,10 @@ class Workspace:
                 ]
             )
 
-        return "\n".join(
-            output
-        )
+        text = "\n".join(output)
+        if structured:
+            return ToolResult(not errors, text)
+        return text
 
     #
     # Tool dispatcher
@@ -694,60 +702,18 @@ class Workspace:
             f"Unknown workspace tool: {tool}"
         )
 
-    #
-    # Audit trail
-    #
-
-    def write_task_result(
-        self,
-        task,
-        agent_name,
-        status,
-        summary,
-        output,
-    ):
-        task_id = self._safe_name(
-            task.id
-        )
-
-        path = (
-            self.audit
-            / f"{task_id}.md"
-        )
-
-        content = [
-            f"# {task.id}: {task.title}",
-            "",
-            f"**Agent:** {agent_name}",
-            f"**Status:** {status}",
-            "",
-        ]
-
-        if summary:
-            content.extend(
-                [
-                    "## Summary",
-                    "",
-                    summary,
-                    "",
-                ]
+    def execute_tool_result(self, tool, **arguments):
+        """Structured outcome for sessions; execute_tool retains its text API."""
+        if tool == "run":
+            return self.run(arguments.get("command", ""), structured=True)
+        if tool == "browser_check":
+            return self.browser_check(
+                arguments.get("path") or "index.html",
+                wait_ms=arguments.get("wait_ms", 1500),
+                structured=True,
             )
+        return ToolResult(True, self.execute_tool(tool, **arguments))
 
-        if output:
-            content.extend(
-                [
-                    "## Output",
-                    "",
-                    output,
-                    "",
-                ]
-            )
-
-        path.write_text(
-            "\n".join(content),
-            encoding="utf-8",
-        )
-
-        return path.relative_to(
-            self.root
-        )
+    def write_task_result(self, task, agent_name, status, summary, output):
+        """Compatibility entry point; reports are owned by AuditStore."""
+        return self.audit_store.write_task_result(task, agent_name, status, summary, output)

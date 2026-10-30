@@ -237,7 +237,7 @@ class Agent:
                 "When communicating with another agent:",
                 "- Use the exact agent name listed above.",
                 "- Never invent agent names or roles.",
-                "- Do not refer to a generic 'Director' unless that is the exact name of an agent.",
+                "- Do not refer to a generic 'Supervisor' unless that is the exact name of an agent.",
                 "- Do not message yourself unless there is a specific reason to do so.",
             ]
         )

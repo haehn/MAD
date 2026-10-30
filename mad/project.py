@@ -10,10 +10,11 @@ class Project:
         self.workspace = workspace
         self.success = success or []
         self.agents = agents or []
+        self.tasks = []
 
     @classmethod
     def from_file(cls, path):
-        from mad.parser import ProjectParser
+        from mad.project_parser import ProjectParser
         return ProjectParser(path).parse()
 
     def __repr__(self):

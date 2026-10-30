@@ -1,11 +1,12 @@
 # MAD Agents
 
-Agent templates for **MAD — Multi Agent Development**.
+Agent templates for **MAD — Multi Agent Driver**.
 
 ## Structure
 
 - `core/` — general-purpose roles usable across project types
 - `software/` — software-engineering-specific roles
+- `TASK.md` — shared task execution guidance used by all roles
 
 ## Concept
 

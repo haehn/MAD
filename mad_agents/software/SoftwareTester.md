@@ -1,5 +1,6 @@
 ---
 skills:
+  - external/karpathy
   - core/quality-control
   - core/review
   - core/communication
