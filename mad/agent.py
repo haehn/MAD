@@ -111,6 +111,7 @@ class Agent:
             metadata = yaml.safe_load(header) or {}
         self.instructions = text.strip()
         self.review_instruction = metadata.get('review_instruction', '')
+        self.final_instruction = metadata.get('final_instruction', '')
         self.skill_names = metadata.get('skills', [])
         self.skills = [Skill.load(name, self.mad_root) for name in self.skill_names]
         self.server = server.rstrip('/')

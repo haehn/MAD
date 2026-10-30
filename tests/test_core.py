@@ -344,6 +344,44 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((Path(root) / '.mad/audit/project-review.json').exists())
             self.assertFalse(any('tool' == record['request']['action'] for record in runtime.workspace.evidence.values()))
 
+    async def test_final_review_guidance_is_in_event_and_after_inspection(self):
+        with tempfile.TemporaryDirectory() as root:
+            read = dict(action='tool', tool='read', path='report.md')
+            supervisor = FakeModel(dict(action='plan', tasks=[definition(artifacts=['report.md'])]),
+                                   accept, read, finish)
+            writer = FakeModel(dict(action='tool', tool='write', path='report.md', content='Actual findings.'),
+                               dict(action='result', status='completed', summary='Ready', output='report.md'))
+            runtime, accepted = await self.run_project(root, supervisor, writer)
+            self.assertTrue(accepted)
+            instruction = runtime.project.agents[0].final_instruction
+            self.assertIn('ONE finish action', instruction)
+            self.assertTrue(supervisor.calls[2]['messages'][1]['content'].startswith(instruction))
+            feedback = json.loads(supervisor.calls[3]['messages'][-1]['content'])
+            self.assertEqual(feedback['next_action'], instruction)
+            self.assertEqual(feedback['result'], 'Actual findings.')
+            saved = json.loads((Path(root) / '.mad/audit/project-review.json').read_text())
+            self.assertEqual(saved['request']['action'], 'finish')
+            self.assertTrue(saved['request']['accepted'])
+
+    async def test_exhausted_final_review_stops_unaccepted_without_raising(self):
+        with tempfile.TemporaryDirectory() as root:
+            read = dict(action='tool', tool='read', path='report.md')
+            supervisor = FakeModel(dict(action='plan', tasks=[definition(artifacts=['report.md'])]),
+                                   accept, *([read] * 6))
+            writer = FakeModel(dict(action='tool', tool='write', path='report.md', content='Actual findings.'),
+                               dict(action='result', status='completed', summary='Ready', output='report.md'))
+            runtime, accepted = await self.run_project(root, supervisor, writer)
+            self.assertFalse(accepted)
+            self.assertIsNone(runtime.error)
+            self.assertTrue(runtime.finished.is_set())
+            self.assertTrue(all(worker.done() for worker in runtime.workers))
+            self.assertEqual(runtime.state.get('A').status, 'completed')
+            saved = json.loads((Path(root) / '.mad/audit/project-review.json').read_text())
+            self.assertEqual(saved['request'], {'action': 'error', 'event': 'PROJECT'})
+            self.assertFalse(saved['success'])
+            self.assertIn('Repeated inspections', saved['result'])
+            self.assertNotIn('accepted', saved['request'])
+
     async def test_file_writing_and_fresh_final_inspection(self):
         with tempfile.TemporaryDirectory() as root:
             supervisor = FakeModel(dict(action='plan', tasks=[definition(artifacts=['report.md'])]),
@@ -769,7 +807,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             # Final review first tries old submission evidence, then inspects the real file.
             def old_finish(call):
                 return dict(action='finish', accepted=True, reason='Old claim', evidence=[
-                    ref for ref, record in json.loads(call['messages'][1]['content'])['evidence'].items()
+                    ref for ref, record in json.loads(call['messages'][1]['content'].split('\n\n', 1)[1])['evidence'].items()
                     if record['request']['action'] == 'result'][0:1])
             supervisor = FakeModel(dict(action='plan', tasks=[definition()]), accept, old_finish,
                                    dict(action='tool', tool='read', path='note.md'), finish)

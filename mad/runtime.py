@@ -32,9 +32,10 @@ class Runtime:
         text = json.dumps(data, ensure_ascii=False)
         if len(text) > 50000:
             text = text[:50000] + '\n[Evidence excerpt truncated; inspect artifacts or request more material.]'
-        if event == 'review':
+        if event in {'review', 'project_ready'}:
             supervisor = next(agent for agent in self.project.agents if agent.name == self.state.supervisor)
-            text = supervisor.review_instruction + '\n\n' + text
+            instruction = supervisor.review_instruction if event == 'review' else supervisor.final_instruction
+            text = instruction + '\n\n' + text
         return text
 
     def _actions(self, agent, event):
@@ -73,11 +74,15 @@ class Runtime:
             try:
                 await agent.work(self.project, event, self._actions(agent, event), self._apply)
             except Exception as error:
-                self.workspace.record(agent.name, {'action': 'error', 'event': event.type},
+                record = self.workspace.record(agent.name, {'action': 'error', 'event': event.type},
                                       {'success': False, 'result': str(error)}, event.task_id)
                 if event.type == 'TASK' and self.state.get(event.task_id).status == 'running':
                     await self._submit(agent, event, {'status': 'blocked', 'summary': str(error), 'output': ''},
                                        event.metadata.get('records', []))
+                elif event.type == 'PROJECT':
+                    (self.workspace.audit / 'project-review.json').write_text(json.dumps(record, indent=2))
+                    ui.finish(False, f'Final review did not reach a decision: {error}')
+                    self.finished.set()
                 elif event.type != 'PEER':
                     self.error = error
                     self.finished.set()
@@ -112,6 +117,8 @@ class Runtime:
             record = self.workspace.record(agent.name, step, outcome, event.task_id)
             records.append(record)
             ui.tool_result(agent.name, step, outcome)
+            if event.type == 'PROJECT':
+                return False, {**record, 'next_action': agent.final_instruction}
             return False, record
         if action == 'message':
             if step['recipient'] == agent.name:

@@ -2,6 +2,13 @@
 review_instruction: >-
   Review only the incoming task acceptance criteria. Implementation assigned to
   pending tasks is not required for accepting setup.
+final_instruction: >-
+  All tasks have been accepted. This is the final project review, not another work
+  task. Inspect the current deliverables against the project criteria, then return
+  ONE finish action with accepted true or false, a reason, and evidence IDs.
+  A passing check is evidence: do not repeat it unless something changed. When
+  evidence is insufficient, reject with the missing verification stated explicitly;
+  replan only for a concrete defect requiring corrective work. Do not loop on checks.
 skills:
   - core/planning
   - core/task-decomposition
