@@ -8,11 +8,11 @@ class Skill:
         self.content = content
 
     @classmethod
-    def load(cls, skill_name, root_dir="."):
-        root_dir = Path(root_dir)
+    def load(cls, skill_name, mad_root):
+        mad_root = Path(mad_root)
 
         skill_path = (
-            root_dir
+            mad_root
             / "mad_skills"
             / skill_name
             / "SKILL.md"
@@ -20,8 +20,7 @@ class Skill:
 
         if not skill_path.exists():
             raise FileNotFoundError(
-                f"Skill not found: {skill_name} "
-                f"({skill_path})"
+                f"Skill not found: {skill_name} ({skill_path})"
             )
 
         return cls(
@@ -32,4 +31,3 @@ class Skill:
 
     def __repr__(self):
         return f"Skill(name={self.name!r})"
-        
