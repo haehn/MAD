@@ -1,45 +1,84 @@
 from pathlib import Path
 
+from mad.project import Project
 
-def parse_project(path):
-    text = Path(path).read_text()
 
-    project = {
-        "task": "",
-        "repository": "",
-        "agents": [],
+class ProjectParser:
+    SECTION_NAMES = {
+        "WORKSPACE",
+        "SUCCESS",
+        "AGENTS",
     }
 
-    section = None
+    def __init__(self, path):
+        self.path = Path(path)
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
+    def parse(self):
+        if not self.path.exists():
+            raise FileNotFoundError(f"Project file not found: {self.path}")
 
-        if not line:
-            continue
+        lines = self.path.read_text(encoding="utf-8").splitlines()
 
-        if line.startswith("TASK:"):
-            section = "task"
-            project["task"] = line[len("TASK:"):].strip()
-            continue
+        objective = []
+        workspace = []
+        success = []
+        agents = []
 
-        if line.startswith("REPOSITORY:"):
-            section = "repository"
-            project["repository"] = line[len("REPOSITORY:"):].strip()
-            continue
+        # Everything before the first recognized section is the objective.
+        section = "objective"
 
-        if line.startswith("AGENTS:"):
-            section = "agents"
-            continue
+        for raw_line in lines:
+            line = raw_line.strip()
 
-        if section == "task":
-            project["task"] += " " + line
+            if not line:
+                continue
 
-        elif section == "repository":
-            project["repository"] += " " + line
+            # Detect section headers such as WORKSPACE:
+            if line.endswith(":"):
+                candidate = line[:-1].upper()
 
-        elif section == "agents" and line.startswith("-"):
-            project["agents"].append(line[1:].strip())
+                if candidate in self.SECTION_NAMES:
+                    section = candidate.lower()
+                    continue
 
-    return project
-    
+            if section == "objective":
+                objective.append(line)
+
+            elif section == "workspace":
+                workspace.append(line)
+
+            elif section == "success":
+                success.append(self._list_item(line))
+
+            elif section == "agents":
+                agents.append(self._list_item(line))
+
+        project = Project(
+            objective=" ".join(objective).strip(),
+            workspace=" ".join(workspace).strip(),
+            success=success,
+            agents=agents,
+        )
+
+        self._validate(project)
+        return project
+
+    @staticmethod
+    def _list_item(line):
+        if line.startswith("-"):
+            return line[1:].strip()
+
+        return line
+
+    @staticmethod
+    def _validate(project):
+        if not project.objective:
+            raise ValueError("Project objective is required.")
+
+        if not project.workspace:
+            raise ValueError("WORKSPACE is required.")
+
+        if not project.agents:
+            raise ValueError("AGENTS is required.")
+
+        # SUCCESS is intentionally optional.
