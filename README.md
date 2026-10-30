@@ -1,6 +1,6 @@
 # MAD
 
-**MAD — Multi Agent Driven**
+**MAD — Multi Agent Driver**
 
 MAD is a lightweight framework for running projects with coordinated AI agents.
 

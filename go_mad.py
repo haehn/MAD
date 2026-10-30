@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
+import asyncio
 
 from mad.project import Project
-from mad.llm import LLM
-from mad.ui import console, print_banner, print_project
+from mad.runtime import Runtime
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MAD — Multi Agent Driven"
+        description="MAD — Multi Agent Driver"
     )
 
     parser.add_argument(
@@ -21,7 +21,7 @@ def main():
         "-v",
         "--verbose",
         action="store_true",
-        help="Show detailed project and agent information",
+        help="Show detailed project information",
     )
 
     parser.add_argument(
@@ -30,50 +30,28 @@ def main():
         help="Show model reasoning blocks",
     )
 
+    parser.add_argument(
+        "--server",
+        default="http://localhost:8000/v1",
+        help="vLLM OpenAI-compatible server",
+    )
+
     args = parser.parse_args()
 
-    project = Project.from_file(args.project)
+    project = Project.from_file(
+        args.project
+    )
 
-    # For now every agent gets its own server object,
-    # but all point to the same vLLM endpoint.
-    for agent in project.agents:
-        agent.server = LLM(
-            base_url="http://localhost:8000/v1",
-            show_thinking=args.show_thinking,
-        )
-
-    print_banner()
-    print_project(
-        project,
+    runtime = Runtime(
+        project=project,
+        server=args.server,
+        show_thinking=args.show_thinking,
         verbose=args.verbose,
     )
 
-    director = project.agents[0]
-
-    system_prompt = director.build_system_prompt(project)
-
-    console.print(
-        f"[bold bright_magenta]{director.name.upper()}[/bold bright_magenta]"
+    asyncio.run(
+        runtime.run()
     )
-
-    response = director.server.chat(
-        model=director.model,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Review this project and create the initial "
-                    "project plan and task breakdown."
-                ),
-            },
-        ],
-    )
-
-    console.print(response)
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ def print_banner():
     console.print(banner)
 
     console.print(
-        "[bold white]  MULTI AGENT DRIVEN[/bold white]",
+        "[bold white]>>> MULTI AGENT DRIVER.[/bold white]",
         justify="left",
     )
 

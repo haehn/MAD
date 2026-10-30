@@ -1,11 +1,11 @@
-import re
 from pathlib import Path
-
-MAD_ROOT = Path(__file__).resolve().parent.parent
-
+import re
 import yaml
 
 from mad.skill import Skill
+
+
+MAD_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Agent:
@@ -15,17 +15,20 @@ class Agent:
         description,
         template,
         model,
-        mad_root=MAD_ROOT,
+        mad_root=None,
         server=None,
     ):
         self.name = name
         self.description = description
         self.template = template
         self.model = model
+
+        self.server = server
+        self.message_hub = None
+
         self.mad_root = Path(
             mad_root if mad_root is not None else MAD_ROOT
         )
-        self.server = server
 
         self.instructions = ""
         self.skill_names = []
@@ -35,12 +38,16 @@ class Agent:
         self._load_skills()
 
     @classmethod
-    def from_definition(cls, definition, mad_root=None):
+    def from_definition(
+        cls,
+        definition,
+        mad_root=None,
+    ):
         definition = definition.lstrip("-").strip()
 
         match = re.match(
             r"^(.*?)\s*\(([^:]+):(.+)\)\s*$",
-            definition
+            definition,
         )
 
         if not match:
@@ -51,8 +58,13 @@ class Agent:
         role_text, template, model = match.groups()
 
         if " who " in role_text:
-            name, description = role_text.split(" who ", 1)
+            name, description = role_text.split(
+                " who ",
+                1,
+            )
+
             description = "who " + description
+
         else:
             name = role_text
             description = ""
@@ -67,8 +79,15 @@ class Agent:
 
     def _find_template(self):
         candidates = [
-            self.mad_root / "mad_agents" / "core" / self.template,
-            self.mad_root / "mad_agents" / "software" / self.template,
+            self.mad_root
+            / "mad_agents"
+            / "core"
+            / self.template,
+
+            self.mad_root
+            / "mad_agents"
+            / "software"
+            / self.template,
         ]
 
         for path in candidates:
@@ -82,20 +101,33 @@ class Agent:
     def _load_template(self):
         template_path = self._find_template()
 
-        text = template_path.read_text(encoding="utf-8")
+        text = template_path.read_text(
+            encoding="utf-8"
+        )
 
         metadata = {}
         body = text
 
         if text.startswith("---"):
-            parts = text.split("---", 2)
+            parts = text.split(
+                "---",
+                2,
+            )
 
             if len(parts) == 3:
-                metadata = yaml.safe_load(parts[1]) or {}
+                metadata = (
+                    yaml.safe_load(parts[1])
+                    or {}
+                )
+
                 body = parts[2].strip()
 
         self.instructions = body
-        self.skill_names = metadata.get("skills", [])
+
+        self.skill_names = metadata.get(
+            "skills",
+            [],
+        )
 
     def _load_skills(self):
         self.skills = [
@@ -106,30 +138,35 @@ class Agent:
             for skill_name in self.skill_names
         ]
 
-    def __repr__(self):
-        return (
-            f"Agent("
-            f"name={self.name!r}, "
-            f"template={self.template!r}, "
-            f"model={self.model!r}, "
-            f"skills={self.skill_names!r}"
-            f")"
-        )
-
-    def build_system_prompt(self, project):
+    def build_system_prompt(
+        self,
+        project,
+    ):
         parts = []
 
-        # Role
-        parts.append(self.instructions)
+        #
+        # Agent role instructions
+        #
 
-        # Specific role description from Project.md
+        parts.append(
+            self.instructions
+        )
+
+        #
+        # Project-specific role
+        #
+
         if self.description:
             parts.append(
                 "# Project Role\n\n"
-                f"You are acting as **{self.name}** {self.description}."
+                f"You are acting as **{self.name}** "
+                f"{self.description}."
             )
 
+        #
         # Skills
+        #
+
         if self.skills:
             skill_text = []
 
@@ -144,7 +181,10 @@ class Agent:
                 + "\n\n".join(skill_text)
             )
 
+        #
         # Project context
+        #
+
         context = [
             "# Project",
             "",
@@ -156,14 +196,63 @@ class Agent:
         ]
 
         if project.success:
-            context.extend([
-                "",
-                "## Success Criteria",
-            ])
+            context.extend(
+                [
+                    "",
+                    "## Success Criteria",
+                ]
+            )
 
             for item in project.success:
-                context.append(f"- {item}")
+                context.append(
+                    f"- {item}"
+                )
 
-        parts.append("\n".join(context))
+        parts.append(
+            "\n".join(context)
+        )
+
+        #
+        # Team roster
+        #
+
+        team = [
+            "# Team",
+            "",
+            "These are the ONLY agents available in this project:",
+            "",
+        ]
+
+        for agent in project.agents:
+            line = f"- {agent.name}"
+
+            if agent.description:
+                line += f": {agent.description}"
+
+            team.append(line)
+
+        team.extend(
+            [
+                "",
+                "When communicating with another agent:",
+                "- Use the exact agent name listed above.",
+                "- Never invent agent names or roles.",
+                "- Do not refer to a generic 'Director' unless that is the exact name of an agent.",
+                "- Do not message yourself unless there is a specific reason to do so.",
+            ]
+        )
+
+        parts.append(
+            "\n".join(team)
+        )
 
         return "\n\n---\n\n".join(parts)
+
+    def __repr__(self):
+        return (
+            f"Agent("
+            f"name={self.name!r}, "
+            f"template={self.template!r}, "
+            f"model={self.model!r}"
+            f")"
+        )

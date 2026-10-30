@@ -8,8 +8,13 @@ class LLM:
         base_url="http://localhost:8000/v1",
         show_thinking=False,
     ):
-        self.base_url = base_url.rstrip("/")
-        self.show_thinking = show_thinking
+        self.base_url = base_url.rstrip(
+            "/"
+        )
+
+        self.show_thinking = (
+            show_thinking
+        )
 
     def chat(
         self,
@@ -17,22 +22,64 @@ class LLM:
         messages,
         max_tokens=2048,
         temperature=0.2,
+        json_schema=None,
     ):
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        if json_schema is not None:
+            payload[
+                "response_format"
+            ] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "mad_response",
+                    "schema": json_schema,
+                    "strict": True,
+                },
+            }
+
         response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
+            (
+                f"{self.base_url}"
+                f"/chat/completions"
+            ),
+            headers={
+                "Content-Type": (
+                    "application/json"
+                )
             },
+            json=payload,
             timeout=300,
         )
 
-        response.raise_for_status()
+        if not response.ok:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text
 
-        content = response.json()["choices"][0]["message"]["content"]
+            raise RuntimeError(
+                f"vLLM request failed "
+                f"({response.status_code}): "
+                f"{detail}"
+            )
+
+        data = response.json()
+
+        content = (
+            data["choices"][0]
+            ["message"]
+            .get(
+                "content",
+                "",
+            )
+            or ""
+        )
 
         if not self.show_thinking:
             content = re.sub(
