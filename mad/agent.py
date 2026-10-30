@@ -21,7 +21,9 @@ class Agent:
         self.description = description
         self.template = template
         self.model = model
-        self.mad_root = Path(mad_root)
+        self.mad_root = Path(
+            mad_root if mad_root is not None else MAD_ROOT
+        )
 
         self.instructions = ""
         self.skill_names = []
@@ -31,7 +33,7 @@ class Agent:
         self._load_skills()
 
     @classmethod
-    def from_definition(cls, definition, root_dir="."):
+    def from_definition(cls, definition, mad_root=None):
         definition = definition.lstrip("-").strip()
 
         match = re.match(
