@@ -3,6 +3,7 @@
 import sys
 
 from mad.project import Project
+from mad.llm import LLM
 
 
 def main():
@@ -41,6 +42,31 @@ def main():
             for skill in agent.skill_names:
                 print(f"    - {skill}")
 
+    director = project.agents[0]
+
+    system_prompt = director.build_system_prompt(project)
+
+    llm = LLM()
+
+    response = llm.chat(
+        model=director.model,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Review this project and create the initial "
+                    "project plan and task breakdown."
+                ),
+            },
+        ],
+    )
+
+    print("\nDIRECTOR:\n")
+    print(response)
 
 if __name__ == "__main__":
     main()

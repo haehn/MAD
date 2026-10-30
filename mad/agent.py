@@ -113,3 +113,55 @@ class Agent:
             f"skills={self.skill_names!r}"
             f")"
         )
+
+    def build_system_prompt(self, project):
+        parts = []
+
+        # Role
+        parts.append(self.instructions)
+
+        # Specific role description from Project.md
+        if self.description:
+            parts.append(
+                "# Project Role\n\n"
+                f"You are acting as **{self.name}** {self.description}."
+            )
+
+        # Skills
+        if self.skills:
+            skill_text = []
+
+            for skill in self.skills:
+                skill_text.append(
+                    f"## Skill: {skill.name}\n\n"
+                    f"{skill.instructions}"
+                )
+
+            parts.append(
+                "# Assigned Skills\n\n"
+                + "\n\n".join(skill_text)
+            )
+
+        # Project context
+        context = [
+            "# Project",
+            "",
+            "## Objective",
+            project.objective,
+            "",
+            "## Workspace",
+            project.workspace,
+        ]
+
+        if project.success:
+            context.extend([
+                "",
+                "## Success Criteria",
+            ])
+
+            for item in project.success:
+                context.append(f"- {item}")
+
+        parts.append("\n".join(context))
+
+        return "\n\n---\n\n".join(parts)

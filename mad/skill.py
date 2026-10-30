@@ -1,18 +1,19 @@
 from pathlib import Path
 
+import yaml
+
 
 class Skill:
-    def __init__(self, name, path, content):
+    def __init__(self, name, path, instructions, metadata=None):
         self.name = name
         self.path = Path(path)
-        self.content = content
+        self.instructions = instructions
+        self.metadata = metadata or {}
 
     @classmethod
     def load(cls, skill_name, mad_root):
-        mad_root = Path(mad_root)
-
         skill_path = (
-            mad_root
+            Path(mad_root)
             / "mad_skills"
             / skill_name
             / "SKILL.md"
@@ -23,11 +24,21 @@ class Skill:
                 f"Skill not found: {skill_name} ({skill_path})"
             )
 
+        text = skill_path.read_text(encoding="utf-8")
+
+        metadata = {}
+        instructions = text
+
+        if text.startswith("---"):
+            parts = text.split("---", 2)
+
+            if len(parts) == 3:
+                metadata = yaml.safe_load(parts[1]) or {}
+                instructions = parts[2].strip()
+
         return cls(
             name=skill_name,
             path=skill_path,
-            content=skill_path.read_text(encoding="utf-8"),
+            instructions=instructions,
+            metadata=metadata,
         )
-
-    def __repr__(self):
-        return f"Skill(name={self.name!r})"
