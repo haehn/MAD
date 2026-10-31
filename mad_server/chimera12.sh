@@ -5,5 +5,6 @@ vllm serve Qwen/Qwen3-Coder-Next \
   --tensor-parallel-size 8 \
   --max-model-len 32768 \
   --host 0.0.0.0 \
-  --port 8000
-
+  --port 8012 \
+  --download-dir "/tmp/models/" \
+  2>&1 | tee vllm.log
