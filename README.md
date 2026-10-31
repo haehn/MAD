@@ -13,3 +13,5 @@ Start an OpenAI-compatible model server (see `mad_server`), then run an example:
 ```
 
 Project files define the objective, workspace, success criteria, and agents. Deliverables go in the workspace; audit records go in `.mad/audit` inside it.
+
+![MAD screenshot](shot.png)
