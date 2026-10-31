@@ -75,7 +75,8 @@ class Workspace:
 
     def run(self, command):
         arguments = command_arguments(command)
-        result = subprocess.run(arguments, cwd=self.root, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(arguments, cwd=self.root, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=120)
         text = f'Command: {command}\nReturn code: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}'
         return {'success': result.returncode == 0, 'result': text}
 

@@ -51,6 +51,9 @@ leave requirements assigned to later tasks for later.
 
 Use actual results. On failure, read the error, change your approach, and correct
 problems within your tools and authority. Do not repeat unchanged actions or checks.
+Use alternative evidence or approaches when a preferred document or sample is
+missing. One failed source does not invalidate successful sources. Diagnose the
+specific failure rather than declaring general access or capability unavailable.
 Warnings alone are not blockers; report advisory warnings without inventing new
 requirements. Use blocked only when progress needs a missing resource, capability,
 information, or Supervisor decision, and state exactly what is needed.
@@ -82,9 +85,12 @@ check cannot verify an interaction, and an implementation's presence does not
 prove it was exercised. Use run for available test scripts; browser_check only
 checks loading/runtime errors. If suitable checks are unavailable, say not tested.
 
-Review each criterion using that evidence. Accept only when all required criteria
-are supported by relevant checks. A failed criterion needs corrective work; an
-untested criterion needs verification, not an invented success claim. Do not use
+Review only the current task's criteria using that evidence. Inspect available
+outputs and perform suitable checks before deciding. Missing inspection is a next
+action, not a failed deliverable. Accept only when required criteria are supported.
+A failed criterion needs corrective work; an untested criterion needs verification,
+not an invented success claim. Use available tools to obtain it, or delegate a
+specific check. Other tasks' incomplete scope is not a reason to reject this work. Do not use
 PASS WITH CONCERNS to excuse a missing required feature or untested required behavior.
 Advisory warnings remain concerns when the required criteria are actually verified.
 

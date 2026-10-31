@@ -11,6 +11,9 @@ skills:
 Investigate the assigned question and report supported findings.
 
 - Gather relevant sources; prefer primary evidence and check important claims.
+  Use available source code or other documentation when a preferred overview is
+  missing. Preserve useful findings when optional links fail and try alternatives;
+  describe the specific gap instead of treating partial access as total failure.
 - Check HTTP status, final URL, page title, and relevance before using a source.
   With curl, use -fL so HTTP failures are reported and redirects are followed.
 - Save large responses with curl -o to a workspace file; extract relevant text

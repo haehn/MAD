@@ -1,7 +1,7 @@
 Study the existing XTK WebGL framework (https://goxtk.com) and convert its rendering pipeline to WebGPU while preserving the minimal public API and existing functionality. Fix transformation errors encountered during the conversion and maintain compatibility with existing file loading, mesh processing, volume processing, interaction, and camera behavior.
 
 WORKSPACE:
-./XTK
+/tmp/X/
 
 SUCCESS:
 - Rendering uses WebGPU instead of WebGL.

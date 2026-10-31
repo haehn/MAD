@@ -62,6 +62,54 @@ class RoleCoverageTests(unittest.TestCase):
 
 @unittest.skipUnless(os.getenv('MAD_SEMANTIC_TESTS') == '1', 'Opt-in: requires a running model server.')
 class RoleSemanticTests(unittest.IsolatedAsyncioTestCase):
+    async def test_review_inspects_existing_work_despite_unrelated_blocker(self):
+        server = os.getenv('MAD_MODEL_SERVER', 'http://localhost:8000/v1')
+        model = os.getenv('MAD_TEST_MODEL', 'Qwen/Qwen3-8B')
+        with tempfile.TemporaryDirectory(prefix='mad-progress-review-') as root:
+            supervisor = Agent('Supervisor', 'who coordinates a migration', 'Supervisor.md', model, server=server)
+            researcher = Agent('Researcher', 'who analyzes existing code', 'Researcher.md', model)
+            project = Project('Migrate the existing pipeline to a new backend while preserving output.', root,
+                              success=['The migrated pipeline works.'], agents=[supervisor, researcher])
+            runtime = Runtime(project)
+            definitions = [dict(id='TASK-0', title='Analyze current pipeline', owner='Researcher', dependencies=[],
+                                description='Document existing inputs, processing stages, and output.',
+                                acceptance=['Analysis identifies parse_numbers as the input function.',
+                                            'Analysis describes splitting input, summing numbers, and printing the total.'],
+                                artifacts=['analysis.md']),
+                           dict(id='TASK-1', title='Investigate target backend', owner='Researcher', dependencies=[],
+                                description='Research a separate target backend.', acceptance=['Backend interface is documented.'],
+                                artifacts=['backend.md'])]
+            runtime.state.plan('Supervisor', definitions, initial=True)
+            runtime.workspace.write('pipeline.py', 'def parse_numbers(text):\n    return [int(value) for value in text.split()]\nprint(sum(parse_numbers(input())))\n')
+            report = 'Input function: parse_numbers. It splits input into integer values; processing sums the numbers and prints the total.'
+            runtime.workspace.write('analysis.md', report)
+            write = runtime.workspace.record('Researcher', dict(action='tool', tool='write', path='analysis.md', content=report),
+                                             {'success': True, 'result': 'Wrote analysis.md'}, 'TASK-0')
+            runtime.state.start('TASK-0')
+            runtime.state.submit('Researcher', 'TASK-0', dict(status='completed', summary='Analysis saved', output='analysis.md'), [write['id']])
+            runtime.state.get('TASK-1').status = 'blocked'
+            runtime.state.get('TASK-1').result = {'status': 'blocked', 'summary': 'Optional sample URL returned 404; official documentation remains accessible.'}
+            runtime.pending_reviews.add('TASK-0')
+            event = Message('__runtime__', 'Supervisor', 'REVIEW',
+                            runtime._context('review', runtime.state.get('TASK-0'), runtime._evidence([write['id']])), 'TASK-0')
+            steps = []
+
+            async def apply(actor, step, event, reads, records):
+                steps.append(step)
+                if len(steps) > 8:
+                    raise RuntimeError('Review did not decide within eight actions.')
+                if step['action'] == 'tool' and step['tool'] not in {'read', 'list'}:
+                    return False, {'success': False, 'result': 'This review fixture supports file inspection.'}
+                if step['action'] not in {'tool', 'review'}:
+                    return False, {'success': False, 'result': 'Inspect and decide TASK-0; do not change the unrelated task.'}
+                return await runtime._apply(actor, step, event, reads, records)
+
+            await supervisor.work(project, event, runtime._actions(supervisor, event), apply)
+            Path('/tmp/mad-progress-review-semantics.json').write_text(json.dumps(steps, indent=2))
+            self.assertTrue(any(step.get('tool') == 'read' and step.get('path') == 'analysis.md' for step in steps), steps)
+            self.assertEqual(runtime.state.get('TASK-0').status, 'completed', steps)
+            self.assertEqual(runtime.state.get('TASK-1').status, 'blocked')
+
     async def test_behavior_acceptance_requires_relevant_verification(self):
         server = os.getenv('MAD_MODEL_SERVER', 'http://localhost:8000/v1')
         model = os.getenv('MAD_TEST_MODEL', 'Qwen/Qwen3-8B')

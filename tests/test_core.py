@@ -328,6 +328,19 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(json.loads((workspace.audit / 'events.jsonl').read_text())['result'], result['result'])
             self.assertGreater(len(record['result']), 50000)
 
+    def test_non_utf8_command_output_keeps_exit_status_and_readable_text(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            for code in (0, 7):
+                with self.subTest(code=code):
+                    script = f"import os; os.write(1, bytes([111, 107, 32, 154])); os.write(2, bytes([101, 114, 114, 32, 255])); raise SystemExit({code})"
+                    command = shlex.quote(sys.executable) + ' -c ' + shlex.quote(script)
+                    result = workspace.run(command)
+                    self.assertEqual(result['success'], code == 0)
+                    self.assertIn(f'Return code: {code}', result['result'])
+                    self.assertIn('ok \ufffd', result['result'])
+                    self.assertIn('err \ufffd', result['result'])
+
     def test_command_output_cannot_forge_success(self):
         with tempfile.TemporaryDirectory() as root:
             result = Workspace(root).run(f'{sys.executable} -c "print(\'Return code: 0\'); raise SystemExit(7)"')

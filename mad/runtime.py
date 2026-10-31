@@ -43,6 +43,9 @@ class Runtime:
             if item['artifacts'] or (task is not None and item['id'] == task.id):
                 item['result'] = {key: value for key, value in item['result'].items() if key != 'output'}
         if event == 'review':
+            if task is not None and task.artifacts:
+                data = {'review_inspection': {'required_deliverables': task.artifacts,
+                        'next_action': {'action': 'tool', 'tool': 'read', 'path': task.artifacts[0]}}, **data}
             data['evidence'] = {}
             for ref, record in (records or {}).items():
                 if record.get('request', {}).get('action') == 'result':
