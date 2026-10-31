@@ -14,9 +14,9 @@ SUCCESS:
 - Relevant functionality is tested.
 
 AGENTS:
-- Supervisor who plans the full project and supervises all other agents (Supervisor.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Software Architect who designs the technical architecture and interfaces (Architect.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Researcher who studies relevant existing approaches and informs the Supervisor (Researcher.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Backend Coder who implements the backend and API (Coder.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Frontend Coder who implements the user interface and integrates it with the API (Coder.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Quality Control who independently tests and verifies the completed work (Tester.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Supervisor who plans the full project and supervises all other agents (Supervisor.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Software Architect who designs the technical architecture and interfaces (Architect.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Researcher who studies relevant existing approaches and informs the Supervisor (Researcher.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Backend Coder who implements the backend and API (Coder.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Frontend Coder who implements the user interface and integrates it with the API (Coder.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Quality Control who independently tests and verifies the completed work (Tester.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)

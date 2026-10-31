@@ -18,5 +18,5 @@ SUCCESS:
 - Verification distinguishes observed behavior from untested claims.
 
 AGENTS:
-- Supervisor who assigns one complete implementation task to the Coder and reviews its actual deliverables without adding intermediate tasks (Supervisor.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Coder who implements, debugs, and verifies the complete application in one task, then submits the files and verification evidence (Coder.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Supervisor who assigns one complete implementation task to the Coder and reviews its actual deliverables without adding intermediate tasks (Supervisor.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Coder who implements, debugs, and verifies the complete application in one task, then submits the files and verification evidence (Coder.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)

@@ -3,6 +3,7 @@ import contextlib
 import copy
 import io
 import json
+import shlex
 from pathlib import Path
 import sys
 import tempfile
@@ -13,7 +14,7 @@ from rich.console import Console
 
 from mad import ui
 
-from mad.agent import Agent, parse_response, response_schema
+from mad.agent import Agent, parse_response, response_schema, tool_preview
 from mad.messaging import Message, MessageHub
 from mad.project import Project, ProjectState, Task
 from mad.runtime import Runtime
@@ -268,6 +269,65 @@ class WorkspaceTests(unittest.TestCase):
             self.assertFalse(workspace.execute(dict(tool='write', path='other.md', content='bad'), reads, review=True)['success'])
             self.assertEqual(workspace.read('note.md'), 'new')
 
+    def test_shell_operators_are_rejected_before_run_or_serve(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            commands = ['mkdir -p test_dir && echo test > test_dir/test.txt',
+                        'echo a|cat', 'echo a>out', 'echo a;echo b', 'echo a >> out',
+                        'echo a || echo b', 'echo a &', 'cat < input',
+                        'mkdir -p test_dir\necho test']
+            with patch('mad.workspace.subprocess.run') as run, patch('mad.workspace.subprocess.Popen') as serve:
+                for tool in ['run', 'serve']:
+                    for command in commands:
+                        with self.subTest(tool=tool, command=command):
+                            result = workspace.execute(dict(tool=tool, command=command), set())
+                            self.assertFalse(result['success'])
+                            self.assertIn('separate tool calls', result['result'])
+                run.assert_not_called()
+                serve.assert_not_called()
+            self.assertEqual([path.name for path in Path(root).iterdir()], ['.mad'])
+
+    def test_quoted_shell_characters_remain_literal_arguments(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            script = "print(1 > 0); print('a && b | c')"
+            result = workspace.run(f'{sys.executable} -c ' + shlex.quote(script))
+            self.assertTrue(result['success'])
+            self.assertIn('True', result['result'])
+            self.assertIn('a && b | c', result['result'])
+            with patch('mad.workspace.subprocess.Popen') as popen:
+                workspace.serve('echo ">" "&&"', 'literal')
+                self.assertEqual(popen.call_args.args[0], ['echo', '>', '&&'])
+
+    def test_browser_check_rejects_url_with_relative_path_feedback(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            result = workspace.execute(dict(tool='browser_check', path='http://localhost:8000/index.html'), set())
+            self.assertFalse(result['success'])
+            self.assertIn('workspace-relative HTML file path', result['result'])
+            self.assertIn('index.html', result['result'])
+            self.assertIn('not a URL', result['result'])
+            with self.assertRaisesRegex(FileNotFoundError, 'HTML file not found'):
+                workspace.browser_check('missing.html')
+
+    def test_large_command_preview_preserves_full_audit_and_failure_tail(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            script = "print('<html>' + 'x' * 50000 + '</html>'); print('FINAL ERROR', file=__import__('sys').stderr); raise SystemExit(7)"
+            command = shlex.quote(sys.executable) + ' -c ' + shlex.quote(script)
+            result = workspace.run(command)
+            self.assertGreater(len(result['result']), 50000)
+            record = workspace.record('Researcher', dict(action='tool', tool='run', command=command), result, 'A')
+            preview = tool_preview(record)
+            self.assertFalse(preview['success'])
+            self.assertEqual(preview['id'], record['id'])
+            self.assertEqual(preview['request']['command'], command)
+            self.assertLess(len(preview['result']), 4500)
+            self.assertIn('Tool output excerpt', preview['result'])
+            self.assertIn('FINAL ERROR', preview['result'])
+            self.assertEqual(json.loads((workspace.audit / 'events.jsonl').read_text())['result'], result['result'])
+            self.assertGreater(len(record['result']), 50000)
+
     def test_command_output_cannot_forge_success(self):
         with tempfile.TemporaryDirectory() as root:
             result = Workspace(root).run(f'{sys.executable} -c "print(\'Return code: 0\'); raise SystemExit(7)"')
@@ -301,6 +361,24 @@ class WorkspaceTests(unittest.TestCase):
             self.assertIn('Rework: add a source citation.', path.read_text())
             self.assertNotIn('Awaiting Supervisor review.', path.read_text())
             self.assertEqual(events, (workspace.audit / 'events.jsonl').read_text())
+
+    def test_artifact_descriptions_are_literal_paths_with_actionable_feedback(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            workspace.write('index.html', '<html>Actual implementation</html>')
+            declared = 'index.html (updated with Three.js scene code)'
+            with self.assertRaises(ValueError) as caught:
+                workspace.require_artifacts([declared])
+            error = str(caught.exception)
+            self.assertIn(declared, error)
+            self.assertIn('literal declared file path', error)
+            self.assertIn('Supervisor', error)
+            self.assertIn('replan', error)
+            workspace.require_artifacts(['index.html'])
+            self.assertFalse((Path(root) / declared).exists())
+            workspace.write('report (draft).md', 'A legitimately named file.')
+            workspace.write('NOTES', 'An extensionless deliverable.')
+            workspace.require_artifacts(['report (draft).md', 'NOTES'])
 
     def test_audit_is_passive_and_preserves_failed_request(self):
         with tempfile.TemporaryDirectory() as root:
@@ -344,6 +422,54 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((Path(root) / '.mad/audit/project-review.json').exists())
             self.assertFalse(any('tool' == record['request']['action'] for record in runtime.workspace.evidence.values()))
 
+    def test_final_context_summarizes_history_but_keeps_inline_deliverables_and_failures(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = Project('Deliver a report', root, agents=team())
+            body = 'LARGE FILE BODY ' * 5000
+            project.tasks = [Task('A', 'File report', owner='Writer', status='completed', artifacts=['report.md'],
+                                  result={'summary': 'Report saved', 'output': body}),
+                             Task('B', 'Inline analysis', owner='Writer', status='completed',
+                                  result={'summary': 'Analysis', 'output': 'Substantive inline reasoning.'})]
+            runtime = Runtime(project)
+            for tool in ['write', 'read', 'run']:
+                request = dict(action='tool', tool=tool, path='report.md', content=body)
+                runtime.workspace.record('Writer', request, {'success': True, 'result': body}, 'A')
+            failed = runtime.workspace.record('Validator', dict(action='tool', tool='browser_check', path='http://localhost'),
+                                              {'success': False, 'result': 'Use a relative file path.'}, 'A')
+            passed = runtime.workspace.record('Writer', dict(action='tool', tool='browser_check', path='report.html'),
+                                              {'success': True, 'result': json.dumps({'status': 200, 'errors': [],
+                                               'warnings': [body], 'scope': 'Loading/runtime errors only.'})}, 'A')
+            runtime.workspace.record('Writer', dict(action='result', output=body),
+                                     {'success': True, 'result': {'output': body}}, 'A')
+            audit = (runtime.workspace.audit / 'events.jsonl').read_text()
+            context = runtime._context('project_ready', records=runtime.workspace.evidence)
+            self.assertLess(len(context), 10000)
+            data = json.loads(context.split('\n\n', 1)[1])
+            self.assertNotIn('LARGE FILE BODY', data['tasks'][0]['result'].get('output', ''))
+            self.assertEqual(data['tasks'][1]['result']['output'], 'Substantive inline reasoning.')
+            self.assertFalse(data['evidence'][failed['id']]['success'])
+            self.assertIn('relative file path', data['evidence'][failed['id']]['result'])
+            self.assertEqual(data['evidence'][passed['id']]['result']['errors'], [])
+            self.assertIn('Loading/runtime', data['evidence'][passed['id']]['result']['scope'])
+            self.assertNotIn('content', data['evidence']['E1']['request'])
+            self.assertIn('Historical inspection', data['evidence']['E2']['result'])
+            self.assertIn('excerpt', data['evidence']['E3']['result'])
+            self.assertEqual(runtime.workspace.evidence['E1']['request']['content'], body)
+            self.assertEqual(audit, (runtime.workspace.audit / 'events.jsonl').read_text())
+
+    def test_final_review_lists_files_and_supplies_a_read_action(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = Project('Goal', root, agents=team())
+            project.tasks = [Task('A', 'Report', owner='Writer', status='completed', artifacts=['report.md', 'data.txt']),
+                             Task('B', 'Other', owner='Writer', status='completed', artifacts=['report.md']),
+                             Task('C', 'Cancelled', owner='Writer', status='cancelled', artifacts=['obsolete.txt'])]
+            runtime = Runtime(project)
+            context = json.loads(runtime._context('project_ready').split('\n\n', 1)[1])
+            self.assertEqual(context['final_inspection']['required_deliverables'], ['report.md', 'data.txt'])
+            self.assertEqual(context['final_inspection']['next_action'],
+                             {'action': 'tool', 'tool': 'read', 'path': 'report.md'})
+            self.assertNotIn('final_inspection', json.loads(runtime._context('task')))
+
     async def test_final_review_guidance_is_in_event_and_after_inspection(self):
         with tempfile.TemporaryDirectory() as root:
             read = dict(action='tool', tool='read', path='report.md')
@@ -381,6 +507,112 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(saved['success'])
             self.assertIn('Repeated inspections', saved['result'])
             self.assertNotIn('accepted', saved['request'])
+
+    async def test_worker_tool_feedback_points_to_result_without_completing_task(self):
+        with tempfile.TemporaryDirectory() as root:
+            supervisor = FakeModel(dict(action='plan', tasks=[definition(artifacts=['report.md'])]),
+                                   accept, dict(action='tool', tool='read', path='report.md'), finish)
+
+            def submit(call):
+                feedback = json.loads(call['messages'][-1]['content'])
+                self.assertIn('"action":"result"', feedback['next_action'])
+                self.assertIn('echo', feedback['next_action'])
+                self.assertTrue(feedback['success'])
+                self.assertIn('Wrote', feedback['result'])
+                self.assertEqual(runtime.state.get('A').status, 'running')
+                return dict(action='result', status='completed', summary='Ready', output='Report saved; inspected findings.')
+
+            writer = FakeModel(dict(action='tool', tool='write', path='report.md', content='Findings.'), submit)
+            project = Project('Write a report', root, agents=team())
+            runtime = make_runtime(project, {'Supervisor': supervisor, 'Writer': writer})
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(await asyncio.wait_for(runtime.run(), 5))
+            saved = next(record for record in runtime.workspace.evidence.values()
+                         if record['request'].get('tool') == 'write')
+            self.assertNotIn('next_action', saved)
+            self.assertEqual(runtime.state.get('A').status, 'completed')
+
+    async def test_failed_worker_tool_preserves_error_and_completion_guidance(self):
+        with tempfile.TemporaryDirectory() as root:
+            supervisor = FakeModel(dict(action='plan', tasks=[definition()]),
+                                   dict(action='review', verdict='blocked', reason='Required input is unavailable.', evidence=[]))
+
+            def blocked(call):
+                feedback = json.loads(call['messages'][-1]['content'])
+                self.assertFalse(feedback['success'])
+                self.assertIn('absent.md', feedback['result'])
+                self.assertIn('status blocked', feedback['next_action'])
+                return dict(action='result', status='blocked', summary='Missing input', output='absent.md is required.')
+
+            writer = FakeModel(dict(action='tool', tool='read', path='absent.md'), blocked)
+            runtime, accepted = await self.run_project(root, supervisor, writer)
+            self.assertFalse(accepted)
+            self.assertEqual(runtime.state.get('A').status, 'blocked')
+
+    async def test_supervisor_can_correct_descriptive_artifact_after_worker_reports_mismatch(self):
+        with tempfile.TemporaryDirectory() as root:
+            wrong = 'index.html (updated with Three.js scene code)'
+            corrected = definition(artifacts=['index.html'])
+            supervisor = FakeModel(dict(action='plan', tasks=[definition(artifacts=[wrong])]),
+                                   dict(action='replan', tasks=[corrected], reason='Artifacts must name the actual index.html file.'),
+                                   accept, dict(action='tool', tool='read', path='index.html'), finish)
+
+            def report_mismatch(call):
+                feedback = json.loads(call['messages'][-1]['content'])
+                self.assertIn(wrong, feedback['error'])
+                self.assertIn('replan', feedback['error'])
+                return dict(action='result', status='blocked', summary='Artifact declaration mismatch', output=feedback['error'])
+
+            writer = FakeModel(dict(action='tool', tool='write', path='index.html', content='<html>Implementation</html>'),
+                               dict(action='result', status='completed', summary='Ready', output='index.html'),
+                               report_mismatch,
+                               dict(action='result', status='completed', summary='Existing file satisfies corrected path', output='index.html'))
+            runtime, accepted = await self.run_project(root, supervisor, writer)
+            self.assertTrue(accepted)
+            self.assertEqual(runtime.state.get('A').artifacts, ['index.html'])
+            self.assertFalse((Path(root) / wrong).exists())
+            self.assertEqual((Path(root) / 'index.html').read_text(), '<html>Implementation</html>')
+
+    async def test_large_tool_history_is_compacted_without_changing_audit(self):
+        with tempfile.TemporaryDirectory() as root:
+            body = 'START ' + 'raw HTML body ' * 5000 + ' END'
+            for index in range(8):
+                (Path(root) / f'source-{index}.html').write_text(body)
+            supervisor = FakeModel(dict(action='plan', tasks=[definition()]), accept,
+                                   dict(action='tool', tool='read', path='source-0.html'), finish)
+            writer = FakeModel(*[dict(action='tool', tool='read', path=f'source-{i}.html') for i in range(8)],
+                               dict(action='result', status='completed', summary='Assessed the sources', output='Substantive findings.'))
+            runtime, accepted = await self.run_project(root, supervisor, writer)
+            self.assertTrue(accepted)
+            conversation = writer.calls[-1]['messages']
+            self.assertLess(sum(len(message['content']) for message in conversation), 35000)
+            older = json.loads(conversation[3]['content'])
+            latest = json.loads(conversation[-1]['content'])
+            self.assertNotIn('next_action', older)
+            self.assertIn('next_action', latest)
+            self.assertLess(len(older['result']), len(latest['result']))
+            self.assertIn('Tool output excerpt', latest['result'])
+            self.assertEqual(runtime.workspace.evidence['E2']['result'], body)
+            audit = [json.loads(line) for line in (runtime.workspace.audit / 'events.jsonl').read_text().splitlines()]
+            self.assertEqual(next(record for record in audit if record['id'] == 'E2')['result'], body)
+
+    def test_review_evidence_is_bounded_and_inline_output_is_not_cut(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = Project('Analyze sources', root, agents=team())
+            runtime = Runtime(project)
+            inline = 'Substantive analysis ' * 4000
+            task = Task('A', 'Analysis', owner='Writer', status='review', result={'summary': 'Findings', 'output': inline})
+            project.tasks = [task]
+            body = '<html>' + 'HEADER ' * 10000 + '</html>'
+            record = runtime.workspace.record('Writer', dict(action='tool', tool='run', command='curl -fL https://example.test/source'),
+                                              {'success': True, 'result': body}, task.id)
+            context = runtime._context('review', task, {record['id']: record})
+            data = json.loads(context.split('\n\n', 1)[1])
+            self.assertEqual(data['task']['result']['output'], inline)
+            self.assertNotIn('output', data['tasks'][0]['result'])
+            self.assertLess(len(data['evidence'][record['id']]['result']), 1600)
+            self.assertIn('Tool output excerpt', data['evidence'][record['id']]['result'])
+            self.assertEqual(runtime.workspace.evidence[record['id']]['result'], body)
 
     async def test_file_writing_and_fresh_final_inspection(self):
         with tempfile.TemporaryDirectory() as root:
@@ -816,6 +1048,8 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             runtime, result = await self.run_project(root, supervisor, writer)
             self.assertTrue(result)
             self.assertIn('fresh evidence', supervisor.calls[3]['messages'][-1]['content'])
+            self.assertIn('note.md', supervisor.calls[3]['messages'][-1]['content'])
+            self.assertIn('Next action:', supervisor.calls[3]['messages'][-1]['content'])
 
 
 class AdapterTests(unittest.TestCase):

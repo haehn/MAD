@@ -2,6 +2,7 @@
 import asyncio
 import json
 from mad import ui
+from mad.agent import tool_preview
 from mad.messaging import Message, MessageHub
 from mad.project import ProjectState
 from mad.workspace import Workspace
@@ -23,15 +24,53 @@ class Runtime:
     def _evidence(self, ids):
         return {ref: self.workspace.evidence[ref] for ref in ids if ref in self.workspace.evidence}
 
+    def _final_inspection(self):
+        files = list(dict.fromkeys(path for task in self.state.tasks if task.status == 'completed'
+                                   for path in task.artifacts))
+        if not files:
+            files = [path.name for path in self.workspace.root.iterdir() if path.is_file()]
+        action = {'action': 'tool', 'tool': 'read', 'path': files[0]} if files else {
+            'action': 'tool', 'tool': 'list', 'path': '.'}
+        return {'required_deliverables': files, 'next_action': action}
+
     def _context(self, event, task=None, records=None):
         data = {'event': event, 'workspace': str(self.workspace.root),
                 'files': self.workspace.list_files(), 'task': task.to_dict() if task else None,
                 'tasks': [item.to_dict() for item in self.state.tasks],
                 'success': self.project.success or [self.project.objective],
                 'evidence': records or {}}
+        for item in data['tasks']:
+            if item['artifacts'] or (task is not None and item['id'] == task.id):
+                item['result'] = {key: value for key, value in item['result'].items() if key != 'output'}
+        if event == 'review':
+            data['evidence'] = {}
+            for ref, record in (records or {}).items():
+                if record.get('request', {}).get('action') == 'result':
+                    data['evidence'][ref] = {**record, 'request': {'action': 'result'},
+                                             'result': 'Worker claim; substantive output is in the current task result.'}
+                else:
+                    data['evidence'][ref] = tool_preview(record, 1200)
+        if event == 'project_ready':
+            evidence = {}
+            for ref, record in (records or {}).items():
+                preview = tool_preview(record, 600)
+                request = {key: value for key, value in preview['request'].items()
+                           if key in {'action', 'tool', 'path', 'command', 'name', 'wait_ms'}}
+                result = preview.get('result', '')
+                if request.get('tool') == 'browser_check':
+                    try:
+                        page = json.loads(record.get('result', ''))
+                        result = {key: page.get(key) for key in ('status', 'errors', 'scope')}
+                    except (ValueError, TypeError):
+                        result = str(result)[:600]
+                elif request.get('action') == 'result':
+                    result = 'Submission claim; substantive output is in the task result, not independent verification.'
+                elif record['success'] and request.get('tool') in {'read', 'list'}:
+                    result = 'Historical inspection; read the current deliverable for final review.'
+                evidence[ref] = {**{key: record[key] for key in ('id', 'actor', 'task_id', 'success')},
+                                 'request': request, 'result': result}
+            data = {'final_inspection': self._final_inspection(), **data, 'evidence': evidence}
         text = json.dumps(data, ensure_ascii=False)
-        if len(text) > 50000:
-            text = text[:50000] + '\n[Evidence excerpt truncated; inspect artifacts or request more material.]'
         if event in {'review', 'project_ready'}:
             supervisor = next(agent for agent in self.project.agents if agent.name == self.state.supervisor)
             instruction = supervisor.review_instruction if event == 'review' else supervisor.final_instruction
@@ -117,9 +156,14 @@ class Runtime:
             record = self.workspace.record(agent.name, step, outcome, event.task_id)
             records.append(record)
             ui.tool_result(agent.name, step, outcome)
+            preview = tool_preview(record)
             if event.type == 'PROJECT':
-                return False, {**record, 'next_action': agent.final_instruction}
-            return False, record
+                return False, {**preview, 'next_action': agent.final_instruction}
+            if event.type == 'TASK':
+                return False, {**preview, 'next_action': agent.completion_instruction}
+            if event.type == 'REVIEW':
+                return False, {**preview, 'next_action': agent.review_instruction}
+            return False, preview
         if action == 'message':
             if step['recipient'] == agent.name:
                 raise ValueError('Do not message yourself.')
@@ -177,7 +221,9 @@ class Runtime:
                     fresh = {record['id'] for record in records if record['success']
                              and record['request'].get('tool') in {'read', 'run', 'browser_check'}}
                     if not fresh.intersection(step['evidence']):
-                        raise ValueError('Inspect the current artifacts and cite fresh evidence before final approval.')
+                        raise ValueError('Final approval needs fresh evidence from this final-review turn, not old task evidence. '
+                                         'Inspect the current deliverables, then cite the returned evidence IDs. Next action: '
+                                         + json.dumps(self._final_inspection()['next_action']))
             self.project_accepted = step['accepted']
             record = self.workspace.record(agent.name, step, {'success': True, 'result': step['reason']})
             (self.workspace.audit / 'project-review.json').write_text(json.dumps(record, indent=2))

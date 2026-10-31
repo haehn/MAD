@@ -12,6 +12,20 @@ import time
 from urllib.parse import quote
 
 
+def command_arguments(command):
+    arguments = shlex.split(command)
+    if not arguments:
+        raise ValueError('Empty command.')
+    lexer = shlex.shlex(command.strip(), posix=False, punctuation_chars=';&|<>\r\n')
+    lexer.whitespace = ' \t'
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    if any(token and all(char in ';&|<>\r\n' for char in token) for token in lexer):
+        raise ValueError('Commands do not use a shell: chaining, pipes, and redirection are unsupported. '
+                         'Use separate tool calls and write/append for file contents; quote literal operator arguments.')
+    return arguments
+
+
 class Workspace:
     IGNORED_NAMES = {'.git', '.mad', 'node_modules', '__pycache__', '.venv', 'venv',
                      '.pytest_cache', '.mypy_cache'}
@@ -60,19 +74,15 @@ class Workspace:
         return f'Wrote {len(content)} characters to {target.relative_to(self.root)}'
 
     def run(self, command):
-        arguments = shlex.split(command)
-        if not arguments:
-            raise ValueError('Empty command.')
+        arguments = command_arguments(command)
         result = subprocess.run(arguments, cwd=self.root, capture_output=True, text=True, timeout=120)
         text = f'Command: {command}\nReturn code: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}'
-        return {'success': result.returncode == 0, 'result': text[:20000]}
+        return {'success': result.returncode == 0, 'result': text}
 
     def serve(self, command, name='default'):
         if name in self.servers and self.servers[name].poll() is None:
             return f'Server {name} is already running.'
-        arguments = shlex.split(command)
-        if not arguments:
-            raise ValueError('Empty command.')
+        arguments = command_arguments(command)
         log = self.audit / ('server-' + re.sub(r'[^A-Za-z0-9_.-]', '_', name) + '.log')
         with log.open('a', encoding='utf-8') as output:
             self.servers[name] = subprocess.Popen(arguments, cwd=self.root, stdout=output,
@@ -95,10 +105,13 @@ class Workspace:
             self.stop_server(name)
 
     def browser_check(self, path='index.html', wait_ms=1500):
-        from playwright.sync_api import sync_playwright
+        if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', path):
+            raise ValueError('browser_check expects a workspace-relative HTML file path, such as "index.html", '
+                             'not a URL. It starts its own temporary server.')
         target = self.path(path)
         if not target.is_file():
-            raise FileNotFoundError(path)
+            raise FileNotFoundError(f'browser_check HTML file not found: {path}. Use a workspace-relative file path.')
+        from playwright.sync_api import sync_playwright
         class Handler(http.server.SimpleHTTPRequestHandler):
             def log_message(self, format, *args):
                 pass
@@ -168,7 +181,10 @@ class Workspace:
     def require_artifacts(self, paths):
         for path in paths:
             if not self.path(path).is_file():
-                raise ValueError(f'Required artifact is missing: {path}. Create the file with a workspace tool, or report blocked.')
+                raise ValueError(f'Required artifact is missing: {path}. This is the literal declared file path. '
+                                 'Create it if correct; if the declaration contains a description instead of the intended filename, '
+                                 'report the mismatch so the Supervisor can correct artifacts with replan. '
+                                 'Do not rename an existing deliverable just to match explanatory prose.')
 
     def record(self, actor, action, result, task_id=None):
         self.sequence += 1

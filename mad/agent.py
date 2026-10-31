@@ -81,6 +81,26 @@ def parse_response(text, actions):
     return result
 
 
+def tool_preview(record, limit=4000):
+    """Keep tool metadata and bounded excerpts without changing the audit record."""
+    preview = dict(record)
+    request = dict(record.get('request', {}))
+    if 'content' in request:
+        request.pop('content')
+        preview['content_note'] = 'Submitted file content omitted; inspect the file when needed.'
+    command = request.get('command')
+    if isinstance(command, str) and len(command) > limit:
+        request['command'] = command[:limit] + ' [command excerpt]'
+    if request:
+        preview['request'] = request
+    result = preview.get('result')
+    if isinstance(result, str) and len(result) > limit:
+        head = limit * 3 // 4
+        preview['result'] = (result[:head] + '\n[Tool output excerpt; middle omitted. Full output retained in audit. '
+                             'Use targeted inspection for missing material.]\n' + result[-(limit - head):])
+    return preview
+
+
 class Skill:
     def __init__(self, name, path, instructions):
         self.name, self.path, self.instructions = name, Path(path), instructions
@@ -110,6 +130,8 @@ class Agent:
             _, header, text = text.split('---', 2)
             metadata = yaml.safe_load(header) or {}
         self.instructions = text.strip()
+        common = (self.mad_root / 'mad_agents' / 'TASK.md').read_text(encoding='utf-8')
+        self.completion_instruction = common.partition('# Task completion\n')[2].strip()
         self.review_instruction = metadata.get('review_instruction', '')
         self.final_instruction = metadata.get('final_instruction', '')
         self.skill_names = metadata.get('skills', [])
@@ -179,6 +201,25 @@ class Agent:
         observations, unchanged = {}, 0
         records = event.metadata.setdefault('records', [])
         for _ in range(100):
+            for index in range(2, len(conversation)):
+                message = conversation[index]
+                try:
+                    data = json.loads(message['content'])
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                limit = 4000 if index >= len(conversation) - 2 else 400
+                if message['role'] == 'user' and data.get('request', {}).get('action') == 'tool':
+                    preview = tool_preview(data, limit)
+                    if index < len(conversation) - 2:
+                        preview.pop('next_action', None)
+                    message['content'] = json.dumps(preview, ensure_ascii=False)
+                elif message['role'] == 'assistant' and data.get('action') == 'tool':
+                    for key in ('content', 'command'):
+                        if isinstance(data.get(key), str) and len(data[key]) > limit:
+                            data[key] = data[key][:limit] + ' [historical tool argument excerpt; original retained in audit]'
+                    message['content'] = json.dumps(data, ensure_ascii=False)
             step, raw = await self.ask(conversation, actions, review=event.type != 'TASK')
             try:
                 message = None

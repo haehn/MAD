@@ -11,7 +11,7 @@ SUCCESS:
 - The final synthesis reflects discoveries made during the run.
 
 AGENTS:
-- Discussion facilitator who coordinates the investigation and continuously updates the project plan (Supervisor.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Researcher 1 who investigates evidence supporting productivity gains from remote work (Researcher.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Researcher 2 who investigates evidence showing limitations, tradeoffs, or productivity losses (Researcher.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
-- Reviewer who challenges conclusions and identifies missing evidence or unsupported claims (Reviewer.md:Qwen/Qwen3.5-27B-GPTQ-Int4)
+- Discussion facilitator who coordinates the investigation and continuously updates the project plan (Supervisor.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Researcher 1 who investigates evidence supporting productivity gains from remote work (Researcher.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Researcher 2 who investigates evidence showing limitations, tradeoffs, or productivity losses (Researcher.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)
+- Reviewer who challenges conclusions and identifies missing evidence or unsupported claims (Reviewer.md:Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8)

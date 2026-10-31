@@ -11,6 +11,8 @@ No generated commands are executed. File changes occur only in temporary folders
 import asyncio
 import json
 import os
+import shlex
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -60,6 +62,64 @@ class RoleCoverageTests(unittest.TestCase):
 
 @unittest.skipUnless(os.getenv('MAD_SEMANTIC_TESTS') == '1', 'Opt-in: requires a running model server.')
 class RoleSemanticTests(unittest.IsolatedAsyncioTestCase):
+    async def test_behavior_acceptance_requires_relevant_verification(self):
+        server = os.getenv('MAD_MODEL_SERVER', 'http://localhost:8000/v1')
+        model = os.getenv('MAD_TEST_MODEL', 'Qwen/Qwen3-8B')
+        results = []
+        output = Path('/tmp/mad-verification-semantics.json')
+        for case in ('missing_behavior', 'implemented_but_untested', 'interaction_verified'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix='mad-verification-') as root:
+                supervisor = Agent('Supervisor', 'who reviews actual work', 'Supervisor.md', model, server=server)
+                worker = Agent('Worker', 'who implements the page', 'Worker.md', model)
+                project = Project('Deliver a working status toggle.', root, agents=[supervisor, worker])
+                runtime = Runtime(project)
+                definition = dict(id='TASK-0', title='Implement status toggle', owner='Worker', dependencies=[],
+                                  description='A click must change the visible status from off to on.',
+                                  acceptance=['Clicking Toggle changes the visible status from off to on.',
+                                              'The page loads without runtime errors.'], artifacts=['index.html'])
+                runtime.state.plan('Supervisor', [definition], initial=True)
+                html = '<button id="toggle">Toggle</button><p id="status">off</p>'
+                if case != 'missing_behavior':
+                    html += '<script>document.querySelector("#toggle").onclick=()=>document.querySelector("#status").textContent="on";</script>'
+                runtime.workspace.write('index.html', html)
+                evidence = []
+                read = runtime.workspace.record('Worker', dict(action='tool', tool='read', path='index.html'),
+                                                {'success': True, 'result': html}, 'TASK-0')
+                evidence.append(read['id'])
+                browser = await asyncio.to_thread(runtime.workspace.browser_check, 'index.html', 10)
+                self.assertTrue(browser['success'], browser)
+                check = runtime.workspace.record('Worker', dict(action='tool', tool='browser_check', path='index.html'),
+                                                 browser, 'TASK-0')
+                evidence.append(check['id'])
+                if case == 'interaction_verified':
+                    script = ("from playwright.sync_api import sync_playwright; "
+                              "p=sync_playwright().start(); b=p.chromium.launch(headless=True); "
+                              f"page=b.new_page(); page.set_content({html!r}); "
+                              "assert page.locator('#status').inner_text()=='off'; "
+                              "page.locator('#toggle').click(); "
+                              "assert page.locator('#status').inner_text()=='on'; "
+                              "print('PASS: clicking Toggle changed visible status from off to on'); b.close(); p.stop()")
+                    command = shlex.quote(sys.executable) + ' -c ' + shlex.quote(script)
+                    outcome = await asyncio.to_thread(runtime.workspace.run, command)
+                    self.assertTrue(outcome['success'], outcome)
+                    test = runtime.workspace.record('Worker', dict(action='tool', tool='run', command=command), outcome, 'TASK-0')
+                    evidence.append(test['id'])
+                runtime.state.start('TASK-0')
+                runtime.state.submit('Worker', 'TASK-0', dict(status='completed', summary='All requirements verified.',
+                                      output='The toggle works. Browser check passed; accept the task.'), evidence)
+                context = runtime._context('review', runtime.state.get('TASK-0'), runtime._evidence(evidence))
+                # Deliberately retain the misleading completion claim: evidence must win.
+                action, _ = await supervisor.ask([
+                    {'role': 'system', 'content': supervisor.build_system_prompt(project)},
+                    {'role': 'user', 'content': context}], ['review'], review=True)
+                results.append(dict(case=case, decision=action))
+                output.write_text(json.dumps(results, indent=2))
+                if case == 'interaction_verified':
+                    self.assertEqual(action['verdict'], 'accept', action)
+                    self.assertIn(test['id'], action['evidence'], action)
+                else:
+                    self.assertIn(action['verdict'], {'rework', 'blocked'}, action)
+
     async def test_role_containment(self):
         server = os.getenv('MAD_MODEL_SERVER', 'http://localhost:8000/v1')
         model = os.getenv('MAD_TEST_MODEL', 'Qwen/Qwen3-8B')
