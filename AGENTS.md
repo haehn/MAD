@@ -1,6 +1,6 @@
 # MAD Development Rules
 
-MAD means **Multi Agent Driver**: agents with roles and skills communicate and perform tasks, while a Supervisor keeps the project on track.
+MAD means **Multi Agent Driver**: agents with roles communicate and perform work, while a Supervisor keeps the project on track.
 
 ## Simple is better
 
@@ -16,39 +16,39 @@ MAD means **Multi Agent Driver**: agents with roles and skills communicate and p
 
 ## Markdown guides; Python enforces
 
-Put roles, responsibilities, planning and review guidance, judgment, and domain knowledge in Markdown templates and skills.
+Put roles, responsibilities, planning and review guidance, judgment, and domain knowledge in Markdown. Shared agent guidance lives in `mad/instructions.md`; role templates live in `mad_agents/`.
 
-Keep Python focused on mechanics: parsing, state transitions, scheduling, messaging, model calls, tools, schemas, evidence, retries, filesystem safety, and audit storage.
+Keep Python focused on mechanics: project parsing, async actors, messaging, model calls, action execution, and audit storage.
 
-For example, skepticism about unsupported claims belongs in `Supervisor.md`; enforcing that only the Supervisor can accept a task belongs in Python.
+For example, reviewing actual results belongs in `Supervisor.md`; enforcing that only the Supervisor can finish the project belongs in Python.
 
 Before adding Python complexity, ask whether the behavior belongs in an existing Markdown template.
 
 ## Current structure
 
-- `mad/agent.py`: `Agent`, `Skill`, model interaction, and action schemas/parsing.
-- `mad/project.py`: `Project`, `Task`, and `ProjectState`; project parsing and task-state enforcement.
-- `mad/messaging.py`: `Message` and `MessageHub`; message transport.
-- `mad/runtime.py`: `Runtime`, the orchestration entry point; scheduling and action dispatch.
-- `mad/workspace.py`: generic workspace tools, path safety, evidence, and audit storage.
-- `mad/ui.py`: presentation and logging output through simple functions.
-- `mad_agents/`: role templates and shared turn instructions.
-- `mad_skills/`: reusable Markdown guidance.
-- `mad_server/`: model-serving launch scripts.
+- `mad/agents.py`: `Agent`, `Intelligence`, `Message`, and `Bus`; generic containers, model calls, and inbox transport.
+- `mad/runtime.py`: project parsing, persistent async agent loops, action dispatch, CLI options, and audit records.
+- `mad/ui.py`: console presentation and readable Markdown log formatting.
+- `mad/instructions.md`: shared instructions loaded for every agent at startup.
+- `mad_agents/`: Markdown role templates referenced by project files.
+- `mad_skills/`: retained Markdown reference material; the runtime does not automatically load skills.
+- `mad_server/`: model-serving launch scripts with a separate environment.
 - `go_mad.py`: command-line entry point.
+- `tests/`: regression tests for the current implementation.
 
-Extend these files where the responsibility fits. Do not recreate separate model-client, protocol, skill, task, project-state, or reporter layers without a demonstrated need.
+Keep this layout small. Do not restore the old task graph, ProjectState, separate workspace tools, or protocol layers without a demonstrated need.
 
 ## Preserve the coordination model
 
-- An agent performs work; its role comes from a Markdown template; skills provide reusable guidance; tools execute capabilities.
-- The Supervisor is an ordinary agent using the same work loop, with authority over task-plan mutation and acceptance.
-- Workers submit successful work as `running → review`. Only the Supervisor can accept it as `review → completed`.
-- Acceptance requires evidence. Agent claims alone do not prove that work exists or meets its criteria.
-- Keep task state and authority enforcement in `ProjectState`, not in presentation or messaging.
-- Keep peer conversations bounded; acknowledgements must not create endless reply loops.
-- Keep `.mad/audit` separate from deliverables and inaccessible through agent workspace tools.
-- Preserve the current project Markdown format and agent/template/skill concepts.
+- `Agent` contains only its name, intelligence link, and messaging link.
+- Each agent runs as a persistent async actor with its own inbox and conversation. Different agents can work in parallel and consume messages between model calls.
+- The first agent is the Supervisor. It coordinates through ordinary messages and is the only agent allowed to finish the project.
+- Workers message only the Supervisor; the runtime enforces this routing rule. The Supervisor relays information and decides whether to dispatch independent work in parallel or await prerequisite deliveries. There is no Python task graph or task acceptance state machine.
+- Agents send messages, execute Python, wait for messages, or finish through the existing JSON action protocol. Sending a message ends the turn and waits for new input by default; `"wait": false` explicitly continues the turn for more messages or independent work.
+- Python execution uses the local environment and workspace as its working directory; it is not a filesystem sandbox.
+- Handoffs use saved workspace files referenced by the message `files` field, including designs and review reports. The runtime validates references; recipients read files through Python. Questions and status messages can remain plain text.
+- Keep `.mad/audit` separate from deliverables. Store complete JSONL events and human-readable Markdown logs.
+- Preserve the project Markdown format and role template loading. Bare agent names and direct Python configuration are also supported.
 
 ## Keep MAD generic
 

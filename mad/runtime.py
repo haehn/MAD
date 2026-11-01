@@ -1,264 +1,271 @@
-"""Connect agents, tasks, tools, and inboxes using one action handler."""
+import argparse
 import asyncio
+from datetime import datetime, timezone
 import json
-from mad import ui
-from mad.agent import tool_preview
-from mad.messaging import Message, MessageHub
-from mad.project import ProjectState
-from mad.workspace import Workspace
+from pathlib import Path
+import subprocess
+import sys
+import traceback
+
+from .agents import Agent, Bus, Intelligence, ResponseTooLong
+from . import ui
 
 
-class Runtime:
-    def __init__(self, project, server='http://localhost:8000/v1', show_thinking=False,
-                 verbose=False):
-        self.project, self.verbose = project, verbose
-        self.state = ProjectState(project)
-        self.workspace = Workspace(project.workspace)
-        self.hub = MessageHub()
-        self.server = server.rstrip('/')
-        self.show_thinking = show_thinking
-        self.pending_reviews, self.workers = set(), []
-        self.finished = asyncio.Event()
-        self.project_accepted, self.final_queued, self.error = False, False, None
+PROTOCOL = """
+Respond with one JSON object:
+{"to":"agent name","text":"instructions, question, or status"} sends a message and waits for new input.
+Add "files":["workspace-relative path"] to deliver files or hand existing files to another worker.
+Save all deliveries, including designs and review findings, as workspace files before sending their paths.
+Recipients read the referenced files using Python; messages coordinate work, not replace file deliveries.
+Add "wait":false to a message only to send more messages or continue independent work before waiting.
+Workers may message only the Supervisor. The Supervisor may message any worker and relay information between workers.
+{"python":"Python source code"} executes Python in the workspace and returns its output.
+{"wait":true} waits for another message.
+{"done":"final summary and verification"} finishes the project.
+Use pathlib for files and subprocess for commands. Paths are relative to the workspace.
+The .mad folder contains infrastructure logs, not deliverables; do not read or modify it.
+Execute work rather than claiming it was done. Ask questions when needed and report actual results.
+"""
 
-    def _evidence(self, ids):
-        return {ref: self.workspace.evidence[ref] for ref in ids if ref in self.workspace.evidence}
 
-    def _final_inspection(self):
-        files = list(dict.fromkeys(path for task in self.state.tasks if task.status == 'completed'
-                                   for path in task.artifacts))
-        if not files:
-            files = [path.name for path in self.workspace.root.iterdir() if path.is_file()]
-        action = {'action': 'tool', 'tool': 'read', 'path': files[0]} if files else {
-            'action': 'tool', 'tool': 'list', 'path': '.'}
-        return {'required_deliverables': files, 'next_action': action}
+def record(path, event, **data):
+    if path is None:
+        return
+    entry = {"time": datetime.now(timezone.utc).isoformat(), "run_id": path.stem, "event": event, **data}
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    readable = ui.log_entry(entry)
+    if readable:
+        with path.with_suffix(".md").open("a", encoding="utf-8") as output:
+            output.write(readable)
 
-    def _context(self, event, task=None, records=None):
-        data = {'event': event, 'workspace': str(self.workspace.root),
-                'files': self.workspace.list_files(), 'task': task.to_dict() if task else None,
-                'tasks': [item.to_dict() for item in self.state.tasks],
-                'success': self.project.success or [self.project.objective],
-                'evidence': records or {}}
-        for item in data['tasks']:
-            if item['artifacts'] or (task is not None and item['id'] == task.id):
-                item['result'] = {key: value for key, value in item['result'].items() if key != 'output'}
-        if event == 'review':
-            if task is not None and task.artifacts:
-                data = {'review_inspection': {'required_deliverables': task.artifacts,
-                        'next_action': {'action': 'tool', 'tool': 'read', 'path': task.artifacts[0]}}, **data}
-            data['evidence'] = {}
-            for ref, record in (records or {}).items():
-                if record.get('request', {}).get('action') == 'result':
-                    data['evidence'][ref] = {**record, 'request': {'action': 'result'},
-                                             'result': 'Worker claim; substantive output is in the current task result.'}
-                else:
-                    data['evidence'][ref] = tool_preview(record, 1200)
-        if event == 'project_ready':
-            evidence = {}
-            for ref, record in (records or {}).items():
-                preview = tool_preview(record, 600)
-                request = {key: value for key, value in preview['request'].items()
-                           if key in {'action', 'tool', 'path', 'command', 'name', 'wait_ms'}}
-                result = preview.get('result', '')
-                if request.get('tool') == 'browser_check':
-                    try:
-                        page = json.loads(record.get('result', ''))
-                        result = {key: page.get(key) for key in ('status', 'errors', 'scope')}
-                    except (ValueError, TypeError):
-                        result = str(result)[:600]
-                elif request.get('action') == 'result':
-                    result = 'Submission claim; substantive output is in the task result, not independent verification.'
-                elif record['success'] and request.get('tool') in {'read', 'list'}:
-                    result = 'Historical inspection; read the current deliverable for final review.'
-                evidence[ref] = {**{key: record[key] for key in ('id', 'actor', 'task_id', 'success')},
-                                 'request': request, 'result': result}
-            data = {'final_inspection': self._final_inspection(), **data, 'evidence': evidence}
-        text = json.dumps(data, ensure_ascii=False)
-        if event in {'review', 'project_ready'}:
-            supervisor = next(agent for agent in self.project.agents if agent.name == self.state.supervisor)
-            instruction = supervisor.review_instruction if event == 'review' else supervisor.final_instruction
-            text = instruction + '\n\n' + text
-        return text
 
-    def _actions(self, agent, event):
-        if event.type == 'PEER':
-            return ['done'] if event.metadata.get('reply') else ['message', 'done']
-        if event.type == 'TASK':
-            return ['tool', 'message', 'result']
-        self.state.require_supervisor(agent.name)
-        return {'PLAN': ['tool', 'message', 'plan'],
-                'REVIEW': ['tool', 'message', 'review', 'replan'],
-                'PROJECT': ['tool', 'message', 'replan', 'finish']}[event.type]
+def read_project(path):
+    sections = {"task": [], "workspace": [], "success": [], "agents": []}
+    section = "task"
+    for raw in Path(path).expanduser().read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        header = line[:-1].lower() if line.endswith(":") else None
+        if header in sections:
+            section = header
+        else:
+            sections[section].append(line)
 
-    async def run(self):
-        ui.start(self.project, self.workspace.root, self.verbose)
-        for agent in self.project.agents:
-            agent.server = self.server
-            agent.show_thinking = self.show_thinking
-            self.hub.register(agent.name)
-        try:
-            self.workers = [asyncio.create_task(self._agent_loop(agent)) for agent in self.project.agents]
-            await self.hub.send(Message('__runtime__', self.state.supervisor, 'PLAN', self._context('plan')))
-            await self.finished.wait()
-            if self.error:
-                raise self.error
-            return self.project_accepted
-        finally:
-            for worker in self.workers:
-                worker.cancel()
-            await asyncio.gather(*self.workers, return_exceptions=True)
-            await asyncio.to_thread(self.workspace.stop_servers)
+    task = " ".join(sections["task"])
+    if sections["success"]:
+        task += "\nSuccess criteria:\n" + "\n".join(sections["success"])
+    workspace = " ".join(sections["workspace"])
+    roles, models = {}, {}
+    templates = Path(__file__).resolve().parent.parent / "mad_agents"
+    for line in sections["agents"]:
+        entry = line.removeprefix("-").strip()
+        label, template, model = entry, None, None
+        if " (" in entry:
+            label, _, settings = entry.rpartition(" (")
+            template, separator, model = settings[:-1].partition(":")
+            if not settings.endswith(")") or not separator or not template.strip() or not model.strip():
+                raise ValueError(f"Invalid agent definition: {line}")
+            template, model = template.strip(), model.strip()
+        name, _, description = label.partition(" who ")
+        name = name.strip()
+        if not name or name in roles:
+            raise ValueError(f"Agent names must be nonempty and unique: {name!r}")
+        role = description.strip() or name
+        if template:
+            paths = [templates / folder / template for folder in ("core", "software")]
+            source = next((item for item in paths if item.is_file()), None)
+            if source is None:
+                raise ValueError(f"Role template not found: {template}")
+            role = source.read_text(encoding="utf-8")
+            if role.startswith("---"):
+                role = role.split("---", 2)[2]
+            role = role.strip()
+            if description.strip():
+                role += "\n" + description.strip()
+            models[name] = model
+        roles[name] = role
+    if not sections["task"] or not workspace or not roles:
+        raise ValueError("Task, WORKSPACE, and AGENTS are required.")
+    return task, roles, workspace, models
 
-    async def _agent_loop(self, agent):
+
+async def work(agent, instructions, workspace, supervisor, finished, log_path=None):
+    try:
+        conversation = [{"role": "system", "content": instructions}]
+        feedback = None
+        truncations = 0
         while True:
-            event = await self.hub.receive(agent.name)
-            ui.activity(agent, event)
+            if feedback is None:
+                message = await agent.messaging.receive(agent.name)
+                record(log_path, "message_received", agent=agent.name, sender=message.sender, text=message.text)
+                feedback = f"{message.sender}: {message.text}"
+            inbox = agent.messaging.inboxes[agent.name]
+            while not inbox.empty():
+                message = inbox.get_nowait()
+                record(log_path, "message_received", agent=agent.name, sender=message.sender, text=message.text)
+                feedback += f"\n{message.sender}: {message.text}"
+            conversation.append({"role": "user", "content": feedback})
+            record(log_path, "model_request", agent=agent.name, model=agent.intelligence.model,
+                   server=agent.intelligence.server, messages=conversation)
+            ui.activity(agent.name)
             try:
-                await agent.work(self.project, event, self._actions(agent, event), self._apply)
-            except Exception as error:
-                record = self.workspace.record(agent.name, {'action': 'error', 'event': event.type},
-                                      {'success': False, 'result': str(error)}, event.task_id)
-                if event.type == 'TASK' and self.state.get(event.task_id).status == 'running':
-                    await self._submit(agent, event, {'status': 'blocked', 'summary': str(error), 'output': ''},
-                                       event.metadata.get('records', []))
-                elif event.type == 'PROJECT':
-                    (self.workspace.audit / 'project-review.json').write_text(json.dumps(record, indent=2))
-                    ui.finish(False, f'Final review did not reach a decision: {error}')
-                    self.finished.set()
-                elif event.type != 'PEER':
-                    self.error = error
-                    self.finished.set()
+                reply = await agent.intelligence.reply(conversation, json_mode=True)
+            except ResponseTooLong as error:
+                truncations += 1
+                record(log_path, "action_failed", agent=agent.name, error_type=type(error).__name__,
+                       error=str(error), traceback=traceback.format_exc())
+                if truncations >= 3:
+                    raise
+                feedback = ("Your response was truncated and was not executed. Return a shorter, complete JSON action. "
+                            "Split large work into smaller actions.")
+                ui.error(f"{agent.name}: response truncated; retrying with a shorter action ({truncations}/2).")
+                continue
+            truncations = 0
+            record(log_path, "model_response", agent=agent.name, text=reply)
+            conversation.append({"role": "assistant", "content": reply})
+            conversation[1:] = conversation[1:][-20:]
+            try:
+                action = json.loads(reply)
+                if not isinstance(action, dict):
+                    raise ValueError("Return one JSON object.")
+                if {"to", "text"} <= set(action) <= {"to", "text", "wait", "files"}:
+                    waiting = action.get("wait", True)
+                    if not isinstance(waiting, bool):
+                        raise ValueError("Message wait must be true or false.")
+                    if action["to"] == agent.name:
+                        raise ValueError("Do not message yourself.")
+                    if agent.name != supervisor and action["to"] != supervisor:
+                        raise ValueError(f"Send questions, findings, and reports to {supervisor}; workers cannot message each other.")
+                    text = action["text"]
+                    files = []
+                    if "files" in action:
+                        if not isinstance(action["files"], list) or not action["files"]:
+                            raise ValueError("files must be a nonempty list of workspace-relative file paths.")
+                        root = Path(workspace).resolve()
+                        for name in action["files"]:
+                            if not isinstance(name, str) or not name.strip():
+                                raise ValueError("Each handoff file must have a path.")
+                            relative = Path(name)
+                            path = (root / relative).resolve()
+                            if relative.is_absolute() or not path.is_relative_to(root):
+                                raise ValueError("Handoff files must be inside the workspace and use relative paths.")
+                            relative = path.relative_to(root)
+                            if ".mad" in relative.parts or ".mad" in Path(name).parts:
+                                raise ValueError("Infrastructure logs in .mad are not handoff deliverables.")
+                            if not path.is_file() or path.stat().st_size == 0:
+                                raise ValueError(f"Handoff file is missing or empty: {name}. Save the delivery before sending it.")
+                            files.append(relative.as_posix())
+                        text += "\n\nFiles:\n" + "\n".join(f"- {name}" for name in files)
+                    await agent.messaging.send(agent.name, action["to"], text)
+                    record(log_path, "message_sent", agent=agent.name, recipient=action["to"], text=text, files=files)
+                    ui.message(agent.name, action["to"], text)
+                    if waiting:
+                        record(log_path, "agent_waiting", agent=agent.name, reason="Message sent", recipient=action["to"])
+                        feedback = None
+                    else:
+                        feedback = "Message delivered. Continue your current turn."
+                elif set(action) == {"python"}:
+                    record(log_path, "python_started", agent=agent.name, code=action["python"])
+                    result = await asyncio.to_thread(
+                        subprocess.run, [sys.executable, "-c", action["python"]],
+                        cwd=workspace, capture_output=True, text=True, timeout=30,
+                    )
+                    record(log_path, "python_finished", agent=agent.name, returncode=result.returncode,
+                           stdout=result.stdout, stderr=result.stderr)
+                    ui.tool_result(agent.name, result.returncode, result.stdout, result.stderr)
+                    feedback = json.dumps({"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr})
+                elif action == {"wait": True}:
+                    record(log_path, "agent_waiting", agent=agent.name)
+                    feedback = None
+                elif set(action) == {"done"}:
+                    if agent.name != supervisor:
+                        raise ValueError("Report to the Supervisor; only the Supervisor can finish.")
+                    if not inbox.empty():
+                        record(log_path, "finish_deferred", agent=agent.name, reason="Unread messages")
+                        feedback = "New messages arrived. Consider them before finishing."
+                        continue
+                    record(log_path, "supervisor_finished", agent=agent.name, summary=action["done"])
+                    finished.set_result(action["done"])
+                    return
                 else:
-                    ui.error(f'Peer processing failed: {error}')
+                    raise ValueError("Choose to/text, python, wait, or done.")
+            except (ValueError, TypeError, KeyError, OSError, subprocess.TimeoutExpired) as error:
+                record(log_path, "action_failed", agent=agent.name, error_type=type(error).__name__,
+                       error=str(error), reply=reply)
+                ui.error(f"{agent.name}: {error}")
+                feedback = f"Action failed: {error}"
+    except asyncio.CancelledError:
+        record(log_path, "agent_stopped", agent=agent.name, reason="Cancelled")
+        raise
+    except Exception as error:
+        response = getattr(error, "response", None)
+        record(log_path, "agent_failed", agent=agent.name, error_type=type(error).__name__,
+               error=str(error), response_body=response.text if response is not None else None,
+               traceback=traceback.format_exc())
+        raise
 
-    async def _submit(self, agent, event, result, records):
-        tool_ids = [record['id'] for record in records]
-        self.state.submit(agent.name, event.task_id, result, tool_ids)
-        task = self.state.get(event.task_id)
-        record = self.workspace.record(agent.name, {'action': 'result', **result},
-                                       {'success': True, 'result': result}, task.id)
-        task.evidence.append(record['id'])
-        artifact = self.workspace.task_report(task)
-        self.pending_reviews.add(task.id)
-        ui.task_result(task, artifact)
-        await self.hub.send(Message('__runtime__', self.state.supervisor, 'REVIEW',
-                                   self._context('review', task, self._evidence(task.evidence)), task.id))
-        await self._schedule()
 
-    async def _apply(self, agent, step, event, reads, records):
-        action = step['action']
-        if action not in self._actions(agent, event):
-            raise ValueError('Action is not permitted for this event.')
-        if action in {'plan', 'replan'}:
-            for definition in step['tasks']:
-                for path in definition.get('artifacts', []):
-                    self.workspace.path(path)
-        if action == 'tool':
-            call = {key: value for key, value in step.items() if key != 'action'}
-            outcome = await asyncio.to_thread(self.workspace.execute, call, reads, review=event.type != 'TASK')
-            record = self.workspace.record(agent.name, step, outcome, event.task_id)
-            records.append(record)
-            ui.tool_result(agent.name, step, outcome)
-            preview = tool_preview(record)
-            if event.type == 'PROJECT':
-                return False, {**preview, 'next_action': agent.final_instruction}
-            if event.type == 'TASK':
-                return False, {**preview, 'next_action': agent.completion_instruction}
-            if event.type == 'REVIEW':
-                return False, {**preview, 'next_action': agent.review_instruction}
-            return False, preview
-        if action == 'message':
-            if step['recipient'] == agent.name:
-                raise ValueError('Do not message yourself.')
-            await self.hub.send(Message(agent.name, step['recipient'], 'PEER', step['content'],
-                                        event.task_id, {'reply': event.type == 'PEER'}))
-        elif action == 'done':
-            return True, None
-        elif action == 'plan':
-            self.state.plan(agent.name, step['tasks'], initial=True)
-            ui.plan(self.state.tasks)
-        elif action == 'result':
-            if step['status'] == 'completed':
-                self.workspace.require_artifacts(self.state.get(event.task_id).artifacts)
-            if step['status'] == 'completed' and records and not records[-1]['success']:
-                raise ValueError('Investigate or resolve the last tool failure, or report blocked.')
-            result = {key: step[key] for key in ['status', 'summary', 'output']}
-            await self._submit(agent, event, result, records)
-            return True, None
-        elif action == 'review':
-            if event.task_id not in self.pending_reviews:
-                raise ValueError('No review is pending for the current task.')
-            task = self.state.get(event.task_id)
-            evidence = self._evidence([*task.evidence, *[record['id'] for record in records]])
-            if step['verdict'] == 'accept':
-                self.workspace.require_artifacts(task.artifacts)
-            self.state.review(agent.name, task.id, step['verdict'], step['reason'], step['evidence'], evidence)
-            self.pending_reviews.remove(task.id)
-            self.workspace.task_report(task)
-            ui.review(task, 'blocked' if self.state.stop_reason else step['verdict'], task.feedback)
-        elif action == 'replan':
-            self.state.plan(agent.name, step['tasks'])
-            for definition in step['tasks']:
-                self.state.get(definition['id']).feedback = step['reason']
-            self.final_queued = False
-            if event.type == 'REVIEW':
-                task = self.state.get(event.task_id)
-                if task.status in {'review', 'blocked'}:
-                    record = self.workspace.record(agent.name, step, {'success': True, 'result': 'Plan updated.'}, event.task_id)
-                    return False, {'record': record, 'remaining': f'Decide the current task {task.id} with review.'}
-                self.pending_reviews.discard(task.id)
-        elif action == 'finish':
-            self.state.require_supervisor(agent.name)
-            if not isinstance(step['accepted'], bool) or not step['reason'].strip():
-                raise ValueError('Explicitly accept or reject the project and explain why.')
-            if step['accepted']:
-                if self.pending_reviews or any(task.status not in {'completed', 'cancelled'} for task in self.state.tasks):
-                    raise ValueError('Unresolved tasks prevent project acceptance.')
-                for task in self.state.tasks:
-                    if task.status == 'completed':
-                        self.workspace.require_artifacts(task.artifacts)
-                ids = [ref for task in self.state.tasks if task.status == 'completed' for ref in task.evidence]
-                current = [record['id'] for record in records]
-                self.state.check_evidence(step['reason'], step['evidence'], self._evidence([*ids, *current]))
-                if self.workspace.list_files() != '(directory is empty)':
-                    fresh = {record['id'] for record in records if record['success']
-                             and record['request'].get('tool') in {'read', 'run', 'browser_check'}}
-                    if not fresh.intersection(step['evidence']):
-                        raise ValueError('Final approval needs fresh evidence from this final-review turn, not old task evidence. '
-                                         'Inspect the current deliverables, then cite the returned evidence IDs. Next action: '
-                                         + json.dumps(self._final_inspection()['next_action']))
-            self.project_accepted = step['accepted']
-            record = self.workspace.record(agent.name, step, {'success': True, 'result': step['reason']})
-            (self.workspace.audit / 'project-review.json').write_text(json.dumps(record, indent=2))
-            ui.finish(self.project_accepted, step['reason'])
-            self.finished.set()
-            return True, None
-        else:
-            raise ValueError(f'Unknown action: {action}')
-        record = self.workspace.record(agent.name, step, {'success': True, 'result': 'Action applied.'}, event.task_id)
-        if action == 'message':
-            return event.type == 'PEER', record
-        if self.state.stop_reason:
-            ui.finish(False, self.state.stop_reason)
-            self.finished.set()
-        else:
-            await self._schedule()
-        return True, record
+async def start(task, roles, workspace, server, model, models=None):
+    workspace = Path(workspace).expanduser().resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+    shared_instructions = Path(__file__).with_name("instructions.md").read_text(encoding="utf-8")
+    messaging = Bus()
+    models = models or {}
+    agents = [Agent(name, Intelligence(server, models.get(name, model)), messaging) for name in roles]
+    supervisor = agents[0].name
+    finished = asyncio.get_running_loop().create_future()
+    log_dir = workspace / ".mad" / "audit"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + ".jsonl")
+    record(log_path, "run_started", task=task, roles=roles, workspace=str(workspace), server=server,
+           models={agent.name: agent.intelligence.model for agent in agents})
+    ui.start(task, workspace, agents, log_path=log_path.with_suffix(".md"))
+    try:
+        async with asyncio.timeout(240):
+            async with asyncio.TaskGroup() as group:
+                running = []
+                for agent in agents:
+                    messaging.register(agent.name)
+                    instructions = (f"You are {agent.name}.\n{roles[agent.name]}\n"
+                                    f"Task: {task}\nTeam: {', '.join(roles)}. Supervisor: {supervisor}.\n"
+                                    f"Only {supervisor} may finish, after reviewing workers' results.\n"
+                                    + shared_instructions + "\n" + PROTOCOL)
+                    running.append(group.create_task(work(agent, instructions, workspace, supervisor, finished, log_path)))
+                await messaging.send("user", supervisor, task)
+                record(log_path, "message_sent", agent="user", recipient=supervisor, text=task)
+                summary = await finished
+                for actor in running:
+                    actor.cancel()
+    except BaseException as error:
+        event = "run_cancelled" if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt)) else "run_failed"
+        record(log_path, event, error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())
+        raise
+    record(log_path, "run_finished", summary=summary)
+    ui.finish(summary)
+    return summary
 
-    async def _schedule(self):
-        if self.finished.is_set():
-            return
-        for task in self.state.ready():
-            self.state.start(task.id)
-            await self.hub.send(Message(self.state.supervisor, task.owner, 'TASK',
-                                       self._context('task', task), task.id))
-        if not self.state.planned or self.pending_reviews or any(task.status == 'running' for task in self.state.tasks):
-            return
-        if any(task.status in {'pending', 'blocked'} for task in self.state.tasks):
-            ui.finish(False, 'Blocked or unrunnable tasks remain.')
-            self.finished.set()
-        elif not self.final_queued:
-            self.final_queued = True
-            ids = [ref for task in self.state.tasks for ref in task.evidence]
-            await self.hub.send(Message('__runtime__', self.state.supervisor, 'PROJECT',
-                                       self._context('project_ready', records=self._evidence(ids))))
+
+def run(task=None, roles=None, workspace=None):
+    parser = argparse.ArgumentParser(description="Agents collaborate on a task. The first role coordinates.")
+    parser.add_argument("project", nargs="?", help="Project Markdown file")
+    parser.add_argument("--server", default="http://localhost:8000/v1")
+    parser.add_argument("--model", help="Override the model for all agents")
+    parser.add_argument("--workspace", help="Override the project workspace")
+    args = parser.parse_args()
+    models = {}
+    if args.project:
+        try:
+            task, roles, workspace, models = read_project(args.project)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+    if not task or not roles or not (args.workspace or workspace):
+        parser.error("Provide a project Markdown file with a task, WORKSPACE, and AGENTS.")
+    model = args.model or "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+    asyncio.run(start(task, roles, args.workspace or workspace, args.server, model,
+                      models={} if args.model else models))
+
+
+if __name__ == "__main__":
+    run()
