@@ -9,6 +9,7 @@ class Message:
     sender: str
     recipient: str
     text: str
+    contract: dict | None = None
 
 
 class Bus:
@@ -20,10 +21,10 @@ class Bus:
             raise ValueError(f"Agent already registered: {name}")
         self.inboxes[name] = asyncio.Queue()
 
-    async def send(self, sender, recipient, text):
+    async def send(self, sender, recipient, text, *, contract=None):
         if recipient not in self.inboxes:
             raise ValueError(f"Unknown recipient: {recipient}")
-        await self.inboxes[recipient].put(Message(sender, recipient, text))
+        await self.inboxes[recipient].put(Message(sender, recipient, text, contract))
 
     async def receive(self, name):
         return await self.inboxes[name].get()

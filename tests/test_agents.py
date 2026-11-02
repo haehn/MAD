@@ -26,6 +26,12 @@ def speaker(messages):
     return messages[0]["content"].splitlines()[0].removeprefix("You are ").removesuffix(".")
 
 
+def save_contract(root, name, task, outputs, inputs=()):
+    text = ("# INPUT\n" + "".join(f"- {path}\n" for path in inputs)
+            + f"\n# TASK\n{task}\n\n# OUTPUT\n" + "".join(f"- {path}\n" for path in outputs))
+    Path(root, name).write_text(text)
+
+
 class ContainerTests(unittest.IsolatedAsyncioTestCase):
     def test_agent_contains_only_identity_and_links(self):
         intelligence = Intelligence("http://model/v1", "test")
@@ -175,8 +181,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_supervisor_assigns_work_and_checks_a_generic_deliverable(self):
         scripts = {
             "Supervisor": iter([
-                {"to": "Coder", "text": "Write greeting.txt containing hello."},
-                {"to": "Tester", "text": "Read greeting.txt and assert it contains hello."},
+                {"to": "Coder", "text": "Write greeting.txt containing hello.", "contract": "coder.md"},
+                {"to": "Tester", "text": "Read greeting.txt and assert it contains hello.", "contract": "tester.md"},
                 {"done": "The greeting was independently checked."},
             ]),
             "Coder": iter([
@@ -184,7 +190,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 {"to": "Supervisor", "text": "greeting.txt is ready."}, {"wait": True},
             ]),
             "Tester": iter([
-                {"python": "from pathlib import Path; assert Path('greeting.txt').read_text() == 'hello'; print('Verified greeting')"},
+                {"python": "from pathlib import Path; assert Path('greeting.txt').read_text() == 'hello'; Path('checks.md').write_text('PASS: greeting matches hello'); print('Verified greeting')"},
                 {"to": "Supervisor", "text": "The executed check passed."}, {"wait": True},
             ]),
         }
@@ -197,6 +203,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         roles = {"Supervisor": "Coordinate.", "Coder": "Write.", "Tester": "Verify."}
         with tempfile.TemporaryDirectory() as root:
+            save_contract(root, "coder.md", "Write hello into greeting.txt.", ["greeting.txt"])
+            save_contract(root, "tester.md", "Check greeting.txt and report findings.", ["checks.md"], ["greeting.txt"])
             with patch.object(Intelligence, "reply", reply), contextlib.redirect_stdout(io.StringIO()):
                 summary = await asyncio.wait_for(start("Create and verify a greeting.", roles, root, "http://model/v1", "test"), 3)
             self.assertEqual(Path(root, "greeting.txt").read_text(), "hello")
@@ -227,6 +235,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             for event in requests:
                 self.assertIn(Path(__file__).resolve().parent.parent.joinpath("mad/instructions.md").read_text().strip(),
                               event["messages"][0]["content"])
+                prompt = event["messages"][0]["content"]
+                self.assertIn(roles[event["agent"]], prompt)
+                if event["agent"] == "Supervisor":
+                    self.assertIn("Create and verify a greeting.", prompt)
+                else:
+                    self.assertNotIn("Create and verify a greeting.", json.dumps(event["messages"]))
+                    self.assertNotIn("Task:", prompt)
             first_request = next(event for event in events if event["event"] == "model_request")
             self.assertEqual(len(first_request["messages"]), 2)
             self.assertIn("Create and verify a greeting.", first_request["messages"][0]["content"])
@@ -239,7 +254,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_parsed_project_uses_each_agents_declared_model(self):
         scripts = {
-            "Coordinator": iter([{"to": "Writer", "text": "Write greeting.txt."}, {"done": "Saved."}]),
+            "Coordinator": iter([{"to": "Writer", "text": "Write greeting.txt.", "contract": "writer.md"}, {"done": "Saved."}]),
             "Writer": iter([{"python": "from pathlib import Path; Path('greeting.txt').write_text('hello')"},
                             {"to": "Coordinator", "text": "Saved greeting.txt."}, {"wait": True}]),
         }
@@ -248,12 +263,18 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def reply(intelligence, messages, **kwargs):
             name = speaker(messages)
             seen.add((name, intelligence.model))
+            if name == "Coordinator":
+                self.assertIn("Task: Write a greeting.", messages[0]["content"])
+            else:
+                self.assertNotIn("Task: Write a greeting.", messages[0]["content"])
+                self.assertNotIn("Write a greeting.", json.dumps(messages))
             return json.dumps(next(scripts[name]))
 
         with tempfile.TemporaryDirectory() as root:
             path = Path(root, "project.md")
             path.write_text(f"Write a greeting.\nWORKSPACE:\n{root}\nAGENTS:\n"
                             "- Coordinator (Supervisor.md:planning-model)\n- Writer (Coder.md:writing-model)\n")
+            save_contract(root, "writer.md", "Save hello into greeting.txt.", ["greeting.txt"])
             task, roles, workspace, models = read_project(path)
             with patch.object(Intelligence, "reply", reply), contextlib.redirect_stdout(io.StringIO()):
                 summary = await asyncio.wait_for(start(task, roles, workspace, "http://model/v1", "fallback", models=models), 3)
@@ -336,8 +357,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_design_is_delivered_and_forwarded_through_workspace_files(self):
         scripts = {
             "Supervisor": iter([
-                {"to": "Architect", "text": "Save the chosen word in design.md."},
-                {"to": "Coder", "text": "Read the design and implement greeting.txt.", "files": ["design.md"]},
+                {"to": "Architect", "text": "Save the chosen word in design.md.", "contract": "architect.md"},
+                {"to": "Coder", "text": "Read the design and implement greeting.txt.", "files": ["design.md"], "contract": "coder.md"},
                 {"python": "from pathlib import Path; assert Path('greeting.txt').read_text() == 'cedar'; print(Path('checks.md').read_text())"},
                 {"done": "Reviewed implementation and checks."},
             ]),
@@ -359,6 +380,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return json.dumps(next(scripts[name]))
 
         with tempfile.TemporaryDirectory() as root:
+            save_contract(root, "architect.md", "Write design.md specifying the word cedar.", ["design.md"])
+            save_contract(root, "coder.md", "Read design.md, implement greeting.txt, and save findings.",
+                          ["greeting.txt", "checks.md"], ["design.md"])
             with patch.object(Intelligence, "reply", reply), contextlib.redirect_stdout(io.StringIO()):
                 summary = await asyncio.wait_for(start("Deliver the designed greeting", dict.fromkeys(scripts, "Perform your role."),
                                                        root, "http://model/v1", "test"), 3)

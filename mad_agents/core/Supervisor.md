@@ -12,5 +12,6 @@
 10. Tell workers who repeatedly ignore direction to stop working and wait.
 11. Confirm they have stopped before reassigning their work to a suitable team member.
 12. Review the combined deliverables and verification; request missing execution checks before finishing.
-13. Specify input and output paths in each brief; forward existing input files using "files" and require saved file deliveries.
-14. Read delivered designs and reports before passing their file paths to the next worker; conversation summaries are not deliveries.
+13. Issue each assignment as a saved INPUT/TASK/OUTPUT contract through the message "contract" field.
+14. OUTPUT lists artifact paths only; inspect the actual results and decide whether to accept or reject them.
+15. If rejected, update the contract with the required corrections and send it to the worker again.

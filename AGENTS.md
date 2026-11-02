@@ -30,7 +30,7 @@ Before adding Python complexity, ask whether the behavior belongs in an existing
 - `mad/runtime.py`: project parsing, persistent async agent loops, action dispatch, CLI options, and audit records.
 - `mad/ui.py`: console presentation and readable Markdown log formatting.
 - `mad/instructions.md`: shared instructions loaded for every agent at startup.
-- `mad_agents/`: Markdown role templates referenced by project files.
+- `mad_agents/`: Markdown role templates and `CONTRACT.md`, the INPUT/TASK/OUTPUT template loaded for Supervisor.
 - `mad_skills/`: retained Markdown reference material; the runtime does not automatically load skills.
 - `mad_server/`: model-serving launch scripts with a separate environment.
 - `go_mad.py`: command-line entry point.
@@ -42,10 +42,11 @@ Keep this layout small. Do not restore the old task graph, ProjectState, separat
 
 - `Agent` contains only its name, intelligence link, and messaging link.
 - Each agent runs as a persistent async actor with its own inbox and conversation. Different agents can work in parallel and consume messages between model calls.
-- The first agent is the Supervisor. It coordinates through ordinary messages and is the only agent allowed to finish the project.
+- The first agent is the Supervisor. Only its system prompt receives the full project objective; workers receive their own role and the specific brief and input paths sent by Supervisor. Supervisor coordinates through ordinary messages and is the only agent allowed to finish the project.
 - Workers message only the Supervisor; the runtime enforces this routing rule. The Supervisor relays information and decides whether to dispatch independent work in parallel or await prerequisite deliveries. There is no Python task graph or task acceptance state machine.
 - Agents send messages, execute Python, wait for messages, or finish through the existing JSON action protocol. Sending a message ends the turn and waits for new input by default; `"wait": false` explicitly continues the turn for more messages or independent work.
 - Python execution uses the local environment and workspace as its working directory; it is not a filesystem sandbox.
+- Supervisor issues saved contracts through the message `contract` field. INPUT lists existing paths, TASK defines work and constraints, OUTPUT lists artifacts without acceptance or verification criteria. Runtime validates and loads each contract into the worker turn; workers need one before executing Python. Supervisor accepts or rejects results and sends an updated contract for corrections.
 - Handoffs use saved workspace files referenced by the message `files` field, including designs and review reports. The runtime validates references; recipients read files through Python. Questions and status messages can remain plain text.
 - Keep `.mad/audit` separate from deliverables. Store complete JSONL events and human-readable Markdown logs.
 - Preserve the project Markdown format and role template loading. Bare agent names and direct Python configuration are also supported.

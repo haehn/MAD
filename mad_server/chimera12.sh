@@ -7,5 +7,6 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
   --gpu-memory-utilization 0.92 \
   --host 0.0.0.0 \
   --port 8012 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --download-dir "/tmp/models/" \
   2>&1 | tee vllm.log

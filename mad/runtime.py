@@ -14,7 +14,12 @@ from . import ui
 PROTOCOL = """
 Respond with one JSON object:
 {"to":"agent name","text":"instructions, question, or status"} sends a message and waits for new input.
-Add "files":["workspace-relative path"] to deliver files or hand existing files to another worker.
+Supervisor first writes a contract file using Python, then adds "contract":"contracts/work.md" to send it to one worker.
+OUTPUT paths name future artifacts; do not put them in "files" before they exist.
+Contract contents are included in the worker's message. Workers execute only their current contract and ask Supervisor about problems.
+INPUT lists existing workspace paths (or is empty), TASK describes the work and constraints, OUTPUT lists artifact paths only.
+OUTPUT contains no acceptance or verification criteria. Supervisor decides acceptance and issues an updated contract for corrections.
+Add "files":["workspace-relative path"] to return artifacts or reference existing files.
 Save all deliveries, including designs and review findings, as workspace files before sending their paths.
 Recipients read the referenced files using Python; messages coordinate work, not replace file deliveries.
 Add "wait":false to a message only to send more messages or continue independent work before waiting.
@@ -91,20 +96,76 @@ def read_project(path):
     return task, roles, workspace, models
 
 
+def workspace_path(workspace, name):
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Provide a workspace-relative path.")
+    root = Path(workspace).resolve()
+    relative = Path(name)
+    path = (root / relative).resolve()
+    if relative.is_absolute() or not path.is_relative_to(root):
+        raise ValueError("Paths must be inside the workspace and use relative paths.")
+    if ".mad" in relative.parts or ".mad" in path.relative_to(root).parts:
+        raise ValueError("Infrastructure logs in .mad are not contract inputs or deliverables.")
+    return path
+
+
+def read_contract(workspace, name):
+    path = workspace_path(workspace, name)
+    if not path.is_file():
+        raise ValueError(f"Contract file does not exist: {name}. Use Python to create its INPUT/TASK/OUTPUT sections before sending it.")
+    sections = {}
+    section = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        heading = line[2:].upper() if line.startswith("# ") else ""
+        if heading in {"INPUT", "TASK", "OUTPUT"}:
+            if heading in sections:
+                raise ValueError(f"Duplicate contract section: {heading}.")
+            section = heading
+            sections[section] = []
+        elif line:
+            if section is None:
+                raise ValueError("Contracts start with # INPUT, followed by # TASK and # OUTPUT.")
+            sections[section].append(raw)
+    if list(sections) != ["INPUT", "TASK", "OUTPUT"]:
+        raise ValueError("Contracts require # INPUT, # TASK, and # OUTPUT in that order.")
+    contract = {"path": path.relative_to(Path(workspace).resolve()).as_posix(),
+                "TASK": "\n".join(sections["TASK"]).strip()}
+    if not contract["TASK"]:
+        raise ValueError("Contract TASK must describe the work.")
+    for section in ("INPUT", "OUTPUT"):
+        contract[section] = []
+        for raw in sections[section]:
+            if not raw.strip().startswith("- "):
+                raise ValueError(f"Contract {section} must list paths as '- relative/path'.")
+            item = workspace_path(workspace, raw.strip()[2:].strip())
+            if section == "INPUT" and not item.exists():
+                raise ValueError(f"Contract input does not exist: {raw.strip()[2:]}.")
+            contract[section].append(item.relative_to(Path(workspace).resolve()).as_posix())
+    if not contract["OUTPUT"]:
+        raise ValueError("Contract OUTPUT must list at least one artifact path.")
+    return contract
+
+
 async def work(agent, instructions, workspace, supervisor, finished, log_path=None):
     try:
         conversation = [{"role": "system", "content": instructions}]
         feedback = None
         truncations = 0
+        current_contract = None
         while True:
             if feedback is None:
                 message = await agent.messaging.receive(agent.name)
                 record(log_path, "message_received", agent=agent.name, sender=message.sender, text=message.text)
+                if message.contract is not None:
+                    current_contract = message.contract
                 feedback = f"{message.sender}: {message.text}"
             inbox = agent.messaging.inboxes[agent.name]
             while not inbox.empty():
                 message = inbox.get_nowait()
                 record(log_path, "message_received", agent=agent.name, sender=message.sender, text=message.text)
+                if message.contract is not None:
+                    current_contract = message.contract
                 feedback += f"\n{message.sender}: {message.text}"
             conversation.append({"role": "user", "content": feedback})
             record(log_path, "model_request", agent=agent.name, model=agent.intelligence.model,
@@ -130,7 +191,7 @@ async def work(agent, instructions, workspace, supervisor, finished, log_path=No
                 action = json.loads(reply)
                 if not isinstance(action, dict):
                     raise ValueError("Return one JSON object.")
-                if {"to", "text"} <= set(action) <= {"to", "text", "wait", "files"}:
+                if {"to", "text"} <= set(action) <= {"to", "text", "wait", "files", "contract"}:
                     waiting = action.get("wait", True)
                     if not isinstance(waiting, bool):
                         raise ValueError("Message wait must be true or false.")
@@ -139,27 +200,28 @@ async def work(agent, instructions, workspace, supervisor, finished, log_path=No
                     if agent.name != supervisor and action["to"] != supervisor:
                         raise ValueError(f"Send questions, findings, and reports to {supervisor}; workers cannot message each other.")
                     text = action["text"]
+                    contract = None
+                    if "contract" in action:
+                        if agent.name != supervisor:
+                            raise ValueError("Only the Supervisor can issue or update a contract.")
+                        contract = read_contract(workspace, action["contract"])
+                        text += (f"\n\nContract: {contract['path']}\n\n# INPUT\n"
+                                 + "\n".join(f"- {name}" for name in contract["INPUT"])
+                                 + f"\n\n# TASK\n{contract['TASK']}\n\n# OUTPUT\n"
+                                 + "\n".join(f"- {name}" for name in contract["OUTPUT"]))
                     files = []
                     if "files" in action:
                         if not isinstance(action["files"], list) or not action["files"]:
                             raise ValueError("files must be a nonempty list of workspace-relative file paths.")
-                        root = Path(workspace).resolve()
                         for name in action["files"]:
-                            if not isinstance(name, str) or not name.strip():
-                                raise ValueError("Each handoff file must have a path.")
-                            relative = Path(name)
-                            path = (root / relative).resolve()
-                            if relative.is_absolute() or not path.is_relative_to(root):
-                                raise ValueError("Handoff files must be inside the workspace and use relative paths.")
-                            relative = path.relative_to(root)
-                            if ".mad" in relative.parts or ".mad" in Path(name).parts:
-                                raise ValueError("Infrastructure logs in .mad are not handoff deliverables.")
+                            path = workspace_path(workspace, name)
                             if not path.is_file() or path.stat().st_size == 0:
-                                raise ValueError(f"Handoff file is missing or empty: {name}. Save the delivery before sending it.")
-                            files.append(relative.as_posix())
+                                raise ValueError(f"Handoff file is missing or empty: {name}. The files field is for existing files; omit future OUTPUT paths until the worker creates them.")
+                            files.append(path.relative_to(Path(workspace).resolve()).as_posix())
                         text += "\n\nFiles:\n" + "\n".join(f"- {name}" for name in files)
-                    await agent.messaging.send(agent.name, action["to"], text)
-                    record(log_path, "message_sent", agent=agent.name, recipient=action["to"], text=text, files=files)
+                    await agent.messaging.send(agent.name, action["to"], text, contract=contract)
+                    record(log_path, "message_sent", agent=agent.name, recipient=action["to"], text=text,
+                           files=files, contract=contract)
                     ui.message(agent.name, action["to"], text)
                     if waiting:
                         record(log_path, "agent_waiting", agent=agent.name, reason="Message sent", recipient=action["to"])
@@ -167,6 +229,8 @@ async def work(agent, instructions, workspace, supervisor, finished, log_path=No
                     else:
                         feedback = "Message delivered. Continue your current turn."
                 elif set(action) == {"python"}:
+                    if agent.name != supervisor and current_contract is None:
+                        raise ValueError("No contract received. Ask the Supervisor for an INPUT/TASK/OUTPUT contract before executing work.")
                     record(log_path, "python_started", agent=agent.name, code=action["python"])
                     result = await asyncio.to_thread(
                         subprocess.run, [sys.executable, "-c", action["python"]],
@@ -211,6 +275,7 @@ async def start(task, roles, workspace, server, model, models=None):
     workspace = Path(workspace).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     shared_instructions = Path(__file__).with_name("instructions.md").read_text(encoding="utf-8")
+    contract_template = (Path(__file__).resolve().parent.parent / "mad_agents/CONTRACT.md").read_text(encoding="utf-8")
     messaging = Bus()
     models = models or {}
     agents = [Agent(name, Intelligence(server, models.get(name, model)), messaging) for name in roles]
@@ -228,8 +293,9 @@ async def start(task, roles, workspace, server, model, models=None):
                 running = []
                 for agent in agents:
                     messaging.register(agent.name)
-                    instructions = (f"You are {agent.name}.\n{roles[agent.name]}\n"
-                                    f"Task: {task}\nTeam: {', '.join(roles)}. Supervisor: {supervisor}.\n"
+                    objective = f"Task: {task}\nContract template:\n{contract_template}\n" if agent.name == supervisor else ""
+                    instructions = (f"You are {agent.name}.\n{roles[agent.name]}\n" + objective
+                                    + f"Team: {', '.join(roles)}. Supervisor: {supervisor}.\n"
                                     f"Only {supervisor} may finish, after reviewing workers' results.\n"
                                     + shared_instructions + "\n" + PROTOCOL)
                     running.append(group.create_task(work(agent, instructions, workspace, supervisor, finished, log_path)))
