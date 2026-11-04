@@ -1,29 +1,42 @@
-Run from the MAD repository root. Use a separate environment to keep CrewAI's dependencies separate from MAD:
+Run from the MAD repository root using the isolated CrewAI environment:
 
 ```bash
 python -m venv /tmp/mad-crewai-env
 /tmp/mad-crewai-env/bin/pip install -r mad_crewai/requirements.txt
-/tmp/mad-crewai-env/bin/python -m mad_crewai mad_crewai/examples/solar.md --server http://localhost:8012/v1
+/tmp/mad-crewai-env/bin/python -m mad_crewai mad_crewai/examples/solar.md
 ```
 
-`--model`, `--workers`, and `--workspace` override the defaults. `MAD_API_KEY` supplies an API key if the server requires one. Workspace paths are relative to the current directory, as in the existing examples. Worker code uses this environment's Python; install any project-specific verification dependencies there.
+For a smaller, non-software project:
 
-CrewAI uses native tool calls. For Qwen3-Coder, add these flags to your existing vLLM launch command, keeping its host, port, and memory settings:
+```bash
+/tmp/mad-crewai-env/bin/python -m mad_crewai mad_crewai/examples/brief.md
+```
+
+The project Markdown declares PROJECT, WORKSPACE, INTELLIGENCE, AGENTS, INPUT, OUTPUT, ACCEPTANCE, OWNER, and QA. Structured sections contain YAML. Role paths resolve relative to the Markdown file. Workspace paths resolve relative to the current directory.
+
+INTELLIGENCE supplies default `server` and `model`. Each AGENTS entry has `name` and a `role` Markdown path, and may override `server` and `model`. This supports a larger Supervisor, smaller role-specific workers, and a separate QA model. `--server` and `--model` override shared defaults while preserving explicit agent overrides. `--workspace` overrides the workspace. `MAD_API_KEY` supplies a server key when required.
+
+The human project is the root contract. The Supervisor plans flat delegated contracts with SETTING, INPUT, TASK, OUTPUT, ACCEPTANCE, OWNER, QA, and DEPENDS_ON. Python validates and saves them before work starts. Accepted prerequisite file paths and inline values are inserted into dependent contracts. Independent owners run concurrently; each agent has at most one active assignment, including QA.
+
+Every delivery goes to its separately assigned QA agent, then to Supervisor review. QA must cover every acceptance condition and cite its own recorded observations. Failed or unverified checks prevent acceptance. Corrections create revised contracts and repeat QA. Accepted work unlocks dependencies. Root QA checks the integrated project after all delegated contracts are accepted. Root failures can spawn corrective contracts followed by another root QA pass. The default limit is three revisions per contract; the Supervisor can stop honestly.
+
+`agent.py` wraps CrewAI role and model configuration. `contract.py` holds the contract and project parsing. `Runtime.assemble()` creates the configured team; `runtime.py` schedules work, QA, and Supervisor decisions. Each assignment uses a fresh CrewAI executor. Native hierarchical delegation is disabled so it cannot bypass saved contracts or QA. `workspace.py` handles generic execution, artifact validation, and evidence. `ui.py` shows roles, models, contract IDs, revisions, phases, and state changes.
+
+Audit files live in `.mad/audit/<run>/`: complete events in `events.jsonl`, readable Markdown in `events.md`, and verbose CrewAI output in `crew-output.log`. Saved contract revisions live in `.mad/contracts/<run>/`. Actual deliverables remain outside `.mad`. CLI exit 0 requires root QA and Supervisor acceptance; a stopped or failed project exits nonzero.
+
+Worker Python has local environment permissions, not a filesystem sandbox. Install project-specific verification dependencies in the worker environment. QA is instructed not to edit outputs; declared output changes during QA prevent acceptance. Evidence references prove which reads or executions happened; the models still judge their relevance and sufficiency.
+
+CrewAI uses native tool calls. For Qwen3-Coder, add these flags to your existing vLLM command, retaining its host, port, and memory settings:
 
 ```bash
 --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
-See [vLLM tool calling](https://docs.vllm.ai/en/latest/features/tool_calling/) and the [Qwen3-Coder recipe](https://docs.vllm.ai/projects/recipes/en/stable/Qwen/Qwen3-Coder-480B-A35B.html). Other models need their appropriate parser.
-
-`runtime.py` uses CrewAI's hierarchical process with one Supervisor and generic workers. Markdown supplies their guidance. The existing project parser is reused; existing MAD code is unchanged. Workers execute Python with local environment permissions, not a filesystem sandbox.
-
-This version uses CrewAI delegation rather than MAD's actor scheduler and contract state machine. Contract saving, per-package acceptance, and dependency ordering are instructions to the model, not Python-enforced guarantees. Native hierarchical delegation does not provide MAD's parallel actor execution. A successful CLI exit means CrewAI returned a report, not that the project passed independent verification; read the final acceptance decision.
-
-Actual execution code, stdout, stderr, failures, and the final report are saved in `.mad/audit/<run>/events.jsonl` and readable `events.md`. CrewAI's native log is saved separately as `crew.json`. Audit files are separate from deliverables; generated Python retains normal local filesystem permissions.
+See [vLLM tool calling](https://docs.vllm.ai/en/latest/features/tool_calling/). Other models require their appropriate parser. Shared servers can serve concurrent requests; actual throughput depends on their model and serving capacity.
 
 Tests:
 
 ```bash
-/tmp/mad-crewai-env/bin/python -m unittest mad_crewai.test_runtime -v
+python -m unittest discover -v
+/tmp/mad-crewai-env/bin/python -m unittest discover -v
 ```

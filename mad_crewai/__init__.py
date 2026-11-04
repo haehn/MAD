@@ -1,1 +1,1 @@
-"""MAD using CrewAI's hierarchical process."""
+"""Role-based CrewAI agents executing validated contracts."""

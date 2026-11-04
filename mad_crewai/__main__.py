@@ -1,28 +1,25 @@
 import argparse
 
-from mad_crew.__main__ import project
+from .contract import project
 from .runtime import Runtime
+from . import ui
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MAD with CrewAI: Supervisor and generic workers.')
+    parser = argparse.ArgumentParser(description='MAD: role-based CrewAI agents and parallel contracts with QA.')
     parser.add_argument('project', help='Project Markdown file')
-    parser.add_argument('--server', default='http://localhost:8000/v1')
-    parser.add_argument('--model', default='Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8')
-    parser.add_argument('--workers', type=int, default=2)
-    parser.add_argument('--workspace', help='Override project workspace')
+    parser.add_argument('--server', help='Override the default model server')
+    parser.add_argument('--model', help='Override the default model')
+    parser.add_argument('--workspace', help='Override the project workspace')
     args = parser.parse_args()
     try:
-        task, workspace = project(args.project)
-        runtime = Runtime(task, args.workspace or workspace, args.server, args.model, args.workers)
-        print(f'Workspace: {runtime.workspace}\nAudit: {runtime.audit}')
-        print(runtime.run())
-        return 0
+        root, workspace, agents = project(args.project, server=args.server, model=args.model, workspace=args.workspace)
+        return 0 if Runtime(root, workspace, agents).run() else 1
     except KeyboardInterrupt:
-        print('Stopped.')
+        ui.error('Stopped.')
         return 130
     except Exception as error:
-        print(f'Crew failed: {error}')
+        ui.error(error)
         return 1
 
 
