@@ -40,7 +40,7 @@ Before adding Python complexity, ask whether the behavior belongs in an existing
 ## Preserve the coordination model
 
 - The project Markdown defines the objective and available roles. The first role is Supervisor. Preserve role templates, model suffixes, bare names, and direct Python configuration.
-- Supervisor divides the project into Contracts: role, input, task, output, acceptance criteria, and dependencies. Supervisor owns acceptance and the final project decision.
+- Supervisor divides the project into Contracts: owner (configured worker name), input, task, output, acceptance criteria, and dependencies. Supervisor owns acceptance and the final project decision.
 - Workers execute native CrewAI Tasks and return Deliveries. Output paths name files; an empty output list means the substantive result is delivered inline.
 - Every Delivery goes immediately to a separate QC agent through the worker Task's guardrail. QC returns PASS or FAIL with findings. FAIL returns the contract to the worker through CrewAI's correction retries.
 - Contract states are OPEN → DELIVERED → QC → ACCEPTED; QC failure returns to OPEN. Supervisor accepts QC-passed contracts before dependents start.

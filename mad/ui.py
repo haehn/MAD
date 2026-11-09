@@ -50,7 +50,8 @@ def message(sender, recipient, text):
 def tool_result(name, returncode, stdout, stderr):
     color = 'green' if returncode == 0 else 'red'
     symbol = '✓' if returncode == 0 else '✗'
-    console.print(Text(f'    {symbol} {name}: Python exited {returncode}', style=color))
+    status = 'Execution succeeded' if returncode == 0 else f'Execution failed (exit code {returncode})'
+    console.print(Text(f'    {symbol} {name}: {status}', style=color))
     if stdout:
         console.print(stdout.rstrip(), style='dim', markup=False, highlight=False)
     if stderr:

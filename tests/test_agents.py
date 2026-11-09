@@ -111,7 +111,7 @@ class UITests(unittest.TestCase):
         text = output.getvalue()
         self.assertIn("\x1b[", text)
         for expected in ["MULTI AGENT DRIVER", "Task [bold]", "Lead [red]", "model[blue]", "Message [green]",
-                         "Python exited 0", "Python exited 1", "Check passed [yellow]", "Error [cyan]",
+                         "Execution succeeded", "Execution failed (exit code 1)", "Check passed [yellow]", "Error [cyan]",
                          "Result [magenta]", "Failure [blue]", "Log: ./workspace/.mad/audit/run.md"]:
             self.assertIn(expected, text)
         self.assertNotIn("Project accepted", text)

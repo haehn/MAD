@@ -12,7 +12,7 @@ Start an OpenAI-compatible model server (see `mad_server`), then run an example:
 ./go_mad.py examples/solar.md
 ```
 
-Project files define the objective, workspace, optional success criteria, and available roles. The first agent is the Supervisor. It divides the work into Contracts with a role, input, task, output files (or inline output), acceptance criteria, and dependencies.
+Project files define the objective, workspace, optional success criteria, and available roles. The first agent is the Supervisor. It divides the work into Contracts with an owner (the configured worker name), input, task, output files (or inline output), acceptance criteria, and dependencies.
 
 CrewAI runs independent worker tasks in parallel. Every Delivery goes immediately to Quality Control; FAIL feeds corrections back to the worker through CrewAI's guardrail retries. The Supervisor accepts PASS deliveries before dependent work starts and makes the final project decision. Examples without a QC role receive a separate reviewer automatically.
 

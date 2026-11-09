@@ -125,7 +125,7 @@ class Runtime:
 
         @tool('workspace_python')
         def workspace_python(code: str) -> str:
-            """Run Python to inspect, create, or verify workspace files. Returns actual output and exit code; not a filesystem sandbox."""
+            """Run Python to inspect, create, or verify workspace files. Returns an execution number, actual output, and exit code; not a filesystem sandbox."""
             ui.activity(name)
             self.record('python_started', agent=name, contract=contract.id, code=code)
             try:
@@ -135,10 +135,12 @@ class Runtime:
             except subprocess.TimeoutExpired as error:
                 data = dict(returncode=-1, stdout=str(error.stdout or ''), stderr='Execution exceeded 30 seconds.')
             with self.lock:
-                self.executions.setdefault(contract.id, []).append(dict(agent=name, code=code, **data))
-            self.record('python_finished', agent=name, contract=contract.id, **data)
+                records = self.executions.setdefault(contract.id, [])
+                execution = len(records) + 1
+                records.append(dict(execution=execution, agent=name, code=code, **data))
+            self.record('python_finished', agent=name, contract=contract.id, execution=execution, **data)
             ui.tool_result(name, data['returncode'], '', '')
-            return json.dumps({**data, 'stdout': data['stdout'][:12000], 'stderr': data['stderr'][:12000]})
+            return json.dumps({**data, 'execution': execution, 'stdout': data['stdout'][:12000], 'stderr': data['stderr'][:12000]})
 
         workspace_python.cache_function = lambda arguments, result: False
         return workspace_python
@@ -149,10 +151,13 @@ class Runtime:
             previous, ancestors, writers = set(), {}, {}
             workers = set(self.roles) - {self.supervisor, self.qc}
             for contract in plan.contracts:
-                if not contract.id or contract.id in previous or contract.role not in workers:
-                    raise ValueError('Contract IDs must be unique and roles must name configured workers.')
-                if not contract.task.strip() or not contract.acceptance or any(not c.strip() for c in contract.acceptance):
-                    raise ValueError('Each contract requires a task and explicit acceptance criteria.')
+                if not contract.id or contract.id in previous or contract.owner not in workers:
+                    raise ValueError('Contract IDs must be unique and owners must name configured workers.')
+                if not contract.task.strip() or not contract.acceptance or any(
+                        not c.id.strip() or not c.criterion.strip() or c.verification not in ('inspection', 'execution') for c in contract.acceptance):
+                    raise ValueError('Each criterion requires an ID, text, and inspection or execution verification.')
+                if len({c.id for c in contract.acceptance}) != len(contract.acceptance):
+                    raise ValueError('Acceptance criterion IDs must be unique within a contract.')
                 if len(set(contract.dependencies)) != len(contract.dependencies) or not set(contract.dependencies) <= previous:
                     raise ValueError('List contracts after their prerequisites; dependencies must name earlier IDs.')
                 ancestors[contract.id] = set(contract.dependencies)
@@ -178,8 +183,11 @@ class Runtime:
     def review_delivery(self, contract, output):
         from crewai import Task
 
-        delivery = output.pydantic or Delivery.model_validate_json(output.raw)
-        self.state(contract, 'DELIVERED', contract.role)
+        try:
+            delivery = output.pydantic or Delivery.model_validate_json(output.raw)
+        except ValueError as error:
+            return False, f'Return valid Delivery JSON with output and files, without Markdown fences or commentary. {error}'
+        self.state(contract, 'DELIVERED', contract.owner)
         issues = []
         try:
             paths = [workspace_path(self.workspace, p).relative_to(self.workspace).as_posix() for p in delivery.files]
@@ -192,28 +200,68 @@ class Runtime:
             issues.append(str(error))
         self.state(contract, 'QC', self.qc)
         ui.activity(self.qc)
-        evidence = self.executions.get(contract.id, [])
+        evidence = list(self.executions.get(contract.id, []))
+        review_start = len(evidence)
+        def validate_review(result):
+            try:
+                qc = result.pydantic or QCResult.model_validate_json(result.raw)
+            except ValueError as error:
+                return False, str(error)
+            errors = []
+            criteria = {c.id: c for c in contract.acceptance}
+            reported = [check.criterion_id for check in qc.checks]
+            if set(reported) != set(criteria) or len(reported) != len(criteria):
+                errors.append('Report every acceptance criterion ID exactly once; do not omit, duplicate, or invent IDs.')
+            current_runs = {run['execution'] for run in self.executions.get(contract.id, [])[review_start:]
+                            if run['agent'] == self.qc and run['returncode'] == 0}
+            for check in qc.checks:
+                criterion = criteria.get(check.criterion_id)
+                if not check.evidence.strip():
+                    errors.append(f'Missing evidence: {check.criterion_id}. Describe the observation or why verification could not be performed.')
+                if criterion is None:
+                    continue
+                if check.verification != criterion.verification:
+                    errors.append(f'Wrong verification type: {check.criterion_id}')
+                if check.status == 'PASS' and criterion.verification == 'execution' and (
+                        not check.executions or any(number not in current_runs for number in check.executions)):
+                    errors.append(f'Execution criterion needs successful recorded QC execution evidence from this review: {check.criterion_id}. Run the check or report FAIL with the verification limitation.')
+            if qc.status == 'PASS' and any(check.status == 'FAIL' for check in qc.checks):
+                errors.append('Overall PASS contradicts a failed criterion. Return overall FAIL.')
+            if errors:
+                self.record('qc_report_invalid', agent=self.qc, contract=contract.id, errors=errors, report=qc.model_dump())
+                return False, '\n'.join(errors)
+            for check in qc.checks:
+                check.criterion = criteria[check.criterion_id].criterion
+            return True, result
+
         review = Task(
             name=f'qc-{contract.id}', agent=self.agents[self.qc].copy(),
             description='Review this Delivery against every acceptance criterion. Inspect actual files and run checks '
                         'when the criteria concern observable behavior. Do not fix deliverables. '
                         'Untested required behavior means FAIL, not PASS. Finish once a verdict is supported; '
-                        'do not repeat unchanged checks. Inline deliveries need no file checks. Return concise findings.\n'
+                        'do not repeat unchanged checks. Inline deliveries need no file checks. '
+                        'Report each criterion_id exactly once and preserve its verification type; criterion text is resolved by MAD. '
+                        'Include nonempty evidence describing the observation. Execution criteria must cite successful '
+                        'execution numbers from your own checks during this review; worker and earlier-review runs do not count.\n'
                         + json.dumps(dict(contract=asdict(contract), delivery=delivery.model_dump(),
                                           file_errors=issues, executions=evidence), ensure_ascii=False),
-            expected_output='JSON with status (PASS or FAIL) and concise findings based on actual observations.',
+            expected_output='QC JSON with overall status, findings, and checks. Each check includes criterion_id, status, evidence, verification, and executions (recorded execution numbers for execution checks).',
             output_pydantic=QCResult,
             tools=[self.python_tool(self.qc, contract)],
+            guardrail=validate_review, guardrail_max_retries=2,
         )
-        result = review.execute_sync()
+        try:
+            result = review.execute_sync()
+        except Exception as error:
+            raise RuntimeError(f'QC could not produce a valid review for {contract.id}: {error}') from error
         qc = result.pydantic or QCResult.model_validate_json(result.raw)
         if issues:
-            qc = QCResult(status='FAIL', findings='; '.join(issues) + '\n' + qc.findings)
+            qc = qc.model_copy(update={'status': 'FAIL', 'findings': '; '.join(issues) + '\n' + qc.findings})
         self.reports[contract.id] = qc
         self.record('quality_control', agent=self.qc, contract=contract.id, delivery=delivery.model_dump(), **qc.model_dump())
         ui.contract(self.qc, contract.id, qc.status)
         if qc.status == 'FAIL':
-            self.state(contract, 'OPEN', contract.role)
+            self.state(contract, 'OPEN', contract.owner)
             return False, qc.findings
         output.raw = json.dumps(dict(contract=contract.id, delivery=delivery.model_dump(), qc=qc.model_dump()))
         return True, output
@@ -245,7 +293,7 @@ class Runtime:
                       max_tokens=4096, stream=True, timeout=120, max_retries=0)
             self.agents[name] = Agent(role=name, goal='Fulfill your configured role and assigned contract.',
                                       backstory=role + '\n' + shared, llm=llm,
-                                      allow_delegation=False, max_iter=6, max_retry_limit=0, verbose=False,
+                                      allow_delegation=False, max_iter=12, max_retry_limit=0, verbose=False,
                                       step_callback=lambda step, who=name: self.record(
                                           'model_response', agent=who, text=getattr(step, 'text', str(step))))
         supervisor = self.agents[self.supervisor]
@@ -281,9 +329,9 @@ class Runtime:
 
         for contract in self.contracts.values():
             pending_ids = {c.id for c in pending}
-            if pending and (pending_ids.intersection(contract.dependencies) or any(c.role == contract.role for c in pending)):
+            if pending and (pending_ids.intersection(contract.dependencies) or any(c.owner == contract.owner for c in pending)):
                 checkpoint()
-            agent = self.agents[contract.role].copy()
+            agent = self.agents[contract.owner].copy()
             task = Task(
                 name='work-' + contract.id, agent=agent, async_execution=True,
                 description='Execute only this contract. Read prerequisite deliveries from context. '
@@ -292,7 +340,7 @@ class Runtime:
                 expected_output='A Delivery JSON object: output contains the actual result; files exactly matches the contract output paths. Use files=[] for inline results.',
                 output_pydantic=Delivery,
                 context=[work[name] for name in contract.dependencies],
-                tools=[self.python_tool(contract.role, contract)],
+                tools=[self.python_tool(contract.owner, contract)],
                 guardrail=self.delivery_guardrail(contract), guardrail_max_retries=2)
             tasks.append(task)
             work[contract.id] = task

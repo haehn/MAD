@@ -9,14 +9,20 @@ from unittest.mock import patch
 from crewai.llms.base_llm import BaseLLM
 from rich.console import Console
 
-from mad.contracts import Acceptance, Completion, Contract, Delivery, Plan, QCResult
+from mad.contracts import Acceptance, Completion, Contract, Criterion, CriterionResult, Delivery, Plan, QCResult
 from mad.runtime import Runtime, workspace_path
 from mad import ui
 
 
-def contract(name='write', role='Writer', output=None, dependencies=None):
-    return Contract(id=name, role=role, input='Use the supplied facts.', task='Write the requested result.',
-                    output=output or [], acceptance=['The delivered result is correct.'], dependencies=dependencies or [])
+def contract(name='write', owner='Writer', output=None, dependencies=None):
+    return Contract(id=name, owner=owner, input='Use the supplied facts.', task='Write the requested result.',
+                    output=output or [], acceptance=[Criterion('A1', 'The delivered result is correct.', 'inspection')], dependencies=dependencies or [])
+
+
+def qc_report(item, status='PASS', findings='Inspected the actual delivery against the criterion.'):
+    return QCResult(status=status, findings=findings, checks=[
+        CriterionResult(criterion_id=c.id, criterion=c.criterion, status=status, evidence='Observed the actual delivered text.',
+                        verification=c.verification) for c in item.acceptance])
 
 
 class ScriptedLLM(BaseLLM):
@@ -74,7 +80,7 @@ class ContractTests(unittest.TestCase):
                 task.tools[0].run(code=code)
             return Delivery(output='The actual substantive result.', files=list(item.output))
         if task.name.startswith('qc-'):
-            return QCResult(status='PASS', findings='Inspected the actual delivery against the criterion.')
+            return qc_report(self.runtime.contracts[task.name.removeprefix('qc-')])
         if task.name.startswith('accept-'):
             return Acceptance(accepted=[item.id for item in self.runtime.contracts.values() if item.state == 'QC'])
         if task.name == 'project-review':
@@ -93,6 +99,48 @@ class ContractTests(unittest.TestCase):
         self.assertIn('◆ QC · write · PASS', self.terminal.getvalue())
         self.assertIn('◆ Supervisor · write · ACCEPTED', self.terminal.getvalue())
 
+    def test_invalid_delivery_returns_validation_feedback_before_qc(self):
+        from crewai.tasks.task_output import TaskOutput
+
+        for raw in ('```json\n{"output": "Result", "files": []}\n```',
+                    '{"output": "Result", "files": "wrong type"}'):
+            with self.subTest(raw=raw):
+                output = TaskOutput(description='Delivery', raw=raw, agent='Writer')
+                ok, feedback = self.runtime.review_delivery(self.plan[0], output)
+                self.assertFalse(ok)
+                self.assertIn('Return valid Delivery JSON', feedback)
+                self.assertEqual(self.plan[0].state, 'OPEN')
+                self.assertFalse(self.states)
+                self.assertFalse(self.calls)
+
+    def test_malformed_delivery_uses_native_retry_then_reaches_qc(self):
+        from crewai import Task
+
+        original = self.respond
+        export_output = Task._export_output
+        attempts = 0
+
+        def script(task):
+            nonlocal attempts
+            if task.name == 'work-write':
+                attempts += 1
+                if attempts == 1:
+                    return '```json\n{"output": "Result", "files": []}\n```'
+            return original(task)
+
+        def export(task, result):
+            # Reproduce the observed CrewAI fallback to raw, unparsed output.
+            if task.name == 'work-write' and isinstance(result, str) and result.startswith('```'):
+                return None, None
+            return export_output(task, result)
+
+        self.callback = script
+        with patch.object(Task, '_export_output', export):
+            self.run_project()
+        self.assertEqual(self.calls.count('work-write'), 2)
+        self.assertEqual(self.calls.count('qc-write'), 1)
+        self.assertEqual(self.runtime.contracts['write'].state, 'ACCEPTED')
+
     def test_qc_failure_uses_native_guardrail_retry_before_acceptance(self):
         count = 0
         original = self.respond
@@ -101,7 +149,8 @@ class ContractTests(unittest.TestCase):
             nonlocal count
             if task.name == 'qc-write':
                 count += 1
-                return QCResult(status='FAIL' if count == 1 else 'PASS', findings='Correct the missing comparison.' if count == 1 else 'Correction verified.')
+                return qc_report(self.runtime.contracts['write'], status='FAIL' if count == 1 else 'PASS',
+                                 findings='Correct the missing comparison.' if count == 1 else 'Correction verified.')
             return original(task)
 
         self.callback = script
@@ -113,13 +162,179 @@ class ContractTests(unittest.TestCase):
 
     def test_qc_exhaustion_never_accepts_or_finishes(self):
         original = self.respond
-        self.callback = lambda task: QCResult(status='FAIL', findings='Required behavior failed.') if task.name.startswith('qc-') else original(task)
+        self.callback = lambda task: qc_report(self.runtime.contracts['write'], status='FAIL', findings='Required behavior failed.') if task.name.startswith('qc-') else original(task)
         with self.assertRaises(Exception):
             self.run_project()
         self.assertEqual(self.runtime.contracts['write'].state, 'OPEN')
         self.assertNotIn('project-review', self.calls)
         self.assertNotIn('accept-write', self.calls)
         self.assertEqual(self.calls.count('qc-write'), 3)
+
+    def test_invalid_overall_pass_is_retried_and_never_accepted(self):
+        original = self.respond
+        invalid = [
+            [],
+            [CriterionResult(criterion_id='A1', criterion='The delivered result is correct.', status='FAIL',
+                             evidence='Observed a mismatch.', verification='inspection')],
+            [CriterionResult(criterion_id='A1', criterion='The delivered result is correct.', status='PASS',
+                             evidence='   ', verification='inspection')],
+            [CriterionResult(criterion_id='unknown', criterion='A different criterion.', status='PASS',
+                             evidence='Observed output.', verification='inspection')],
+        ]
+        invalid.append(qc_report(self.plan[0]).checks * 2)
+        for checks in invalid:
+            with self.subTest(checks=checks):
+                self.calls.clear()
+                self.callback = lambda task: QCResult(status='PASS', findings='Claimed pass.', checks=checks) if task.name == 'qc-write' else original(task)
+                with self.assertRaises(Exception):
+                    self.run_project()
+                self.assertEqual(self.calls.count('work-write'), 1)
+                self.assertEqual(self.calls.count('qc-write'), 3)
+                self.assertEqual(self.runtime.contracts['write'].state, 'QC')
+                self.assertNotIn('accept-write', self.calls)
+                self.assertNotIn('project-review', self.calls)
+
+    def test_invalid_qc_report_is_corrected_without_repeating_worker(self):
+        original = self.respond
+        count = 0
+
+        def script(task):
+            nonlocal count
+            if task.name == 'qc-write':
+                count += 1
+                if count == 1:
+                    return QCResult(status='PASS', findings='Incomplete report.')
+            return original(task)
+
+        self.callback = script
+        self.run_project()
+        self.assertEqual(self.calls.count('work-write'), 1)
+        self.assertEqual(self.calls.count('qc-write'), 2)
+        self.assertEqual(self.runtime.contracts['write'].state, 'ACCEPTED')
+        events = [json.loads(line) for line in self.runtime.log.read_text().splitlines()]
+        self.assertTrue(any(e['event'] == 'qc_report_invalid' for e in events))
+
+    def test_unverified_execution_fail_returns_to_worker(self):
+        self.plan[0].acceptance = [Criterion('A1', 'Required behavior works.', 'execution')]
+        original = self.respond
+
+        def script(task):
+            if task.name == 'qc-write':
+                return qc_report(self.runtime.contracts['write'], status='FAIL',
+                                 findings='Could not execute the required behavior; verification is incomplete.')
+            return original(task)
+
+        self.callback = script
+        with self.assertRaises(Exception):
+            self.run_project()
+        self.assertEqual(self.calls.count('work-write'), 3)
+        self.assertEqual(self.calls.count('qc-write'), 3)
+        self.assertEqual(self.runtime.contracts['write'].state, 'OPEN')
+
+    def test_qc_matches_ids_and_restores_original_text(self):
+        self.plan[0].acceptance.append(Criterion('A2', 'The result includes a concise conclusion.', 'inspection'))
+        original = self.respond
+
+        def script(task):
+            if task.name == 'qc-write':
+                report = qc_report(self.runtime.contracts['write'])
+                report.checks.reverse()
+                for check in report.checks:
+                    check.criterion = 'Different wording from the reviewer.'
+                return report
+            return original(task)
+
+        self.callback = script
+        self.run_project()
+        checks = self.runtime.reports['write'].checks
+        self.assertEqual([(c.criterion_id, c.criterion) for c in checks],
+                         [(c.id, c.criterion) for c in reversed(self.plan[0].acceptance)])
+        self.assertEqual(self.calls.count('qc-write'), 1)
+
+    def test_qc_cannot_replace_missing_criterion_with_duplicate_id(self):
+        self.plan[0].acceptance.append(Criterion('A2', 'Another required property.', 'inspection'))
+        original = self.respond
+
+        def script(task):
+            if task.name == 'qc-write':
+                report = qc_report(self.runtime.contracts['write'])
+                report.checks[1].criterion_id = 'A1'
+                return report
+            return original(task)
+
+        self.callback = script
+        with self.assertRaisesRegex(RuntimeError, 'QC could not produce a valid review'):
+            self.run_project()
+        self.assertEqual(self.calls.count('work-write'), 1)
+        self.assertNotIn('accept-write', self.calls)
+
+    def test_plan_rejects_duplicate_and_blank_criterion_ids(self):
+        for identifier in ('A1', ' '):
+            with self.subTest(identifier=identifier):
+                item = contract()
+                item.acceptance.append(Criterion(identifier, 'Another property.', 'inspection'))
+                ok, error = self.runtime.validate_plan(type('Output', (), {'pydantic': Plan(contracts=[item])})())
+                self.assertFalse(ok)
+                self.assertIn('ID', error)
+
+    def test_inspection_pass_needs_no_execution(self):
+        self.run_project()
+        self.assertFalse(self.runtime.executions.get('write'))
+        self.assertEqual(self.runtime.reports['write'].status, 'PASS')
+
+    def test_execution_pass_requires_current_successful_qc_record(self):
+        self.plan[0].acceptance = [Criterion('A1', 'The calculation returns four.', 'execution')]
+        original = self.respond
+
+        def script(task):
+            if task.name == 'qc-write':
+                run = json.loads(task.tools[0].run(code='assert 2 + 2 == 4; print(4)'))
+                report = qc_report(self.runtime.contracts['write'])
+                report.checks[0].evidence = 'Independent calculation printed 4 and assertion passed.'
+                report.checks[0].executions = [run['execution']]
+                return report
+            return original(task)
+
+        self.callback = script
+        self.run_project()
+        self.assertEqual(self.runtime.reports['write'].status, 'PASS')
+        record = self.runtime.executions['write'][0]
+        self.assertEqual((record['agent'], record['returncode'], record['stdout']), ('QC', 0, '4\n'))
+        self.assertEqual(self.runtime.reports['write'].checks[0].executions, [record['execution']])
+
+    def test_execution_cannot_use_missing_worker_failed_or_stale_records(self):
+        self.plan[0].acceptance = [Criterion('A1', 'Required behavior works.', 'execution')]
+        original = self.respond
+        for mode in ('missing', 'worker', 'failed', 'stale', 'wrong_type'):
+            with self.subTest(mode=mode):
+                self.calls.clear()
+                self.runtime.executions.clear()
+                previous = None
+
+                def script(task):
+                    nonlocal previous
+                    if task.name == 'work-write' and mode == 'worker':
+                        previous = json.loads(task.tools[0].run(code='print("worker check")'))['execution']
+                    if task.name == 'qc-write':
+                        report = qc_report(self.runtime.contracts['write'])
+                        if mode in ('failed', 'wrong_type') or (mode == 'stale' and previous is None):
+                            code = 'raise RuntimeError("failed check")' if mode == 'failed' else 'print("checked")'
+                            previous = json.loads(task.tools[0].run(code=code))['execution']
+                            if mode == 'stale':
+                                report.status = 'FAIL'
+                        if previous is not None:
+                            report.checks[0].executions = [previous]
+                        if mode == 'wrong_type':
+                            report.checks[0].verification = 'inspection'
+                        return report
+                    return original(task)
+
+                self.callback = script
+                with self.assertRaises(Exception):
+                    self.run_project()
+                self.assertEqual(self.calls.count('qc-write'), 4 if mode == 'stale' else 3)
+                self.assertEqual(self.calls.count('work-write'), 2 if mode == 'stale' else 1)
+                self.assertNotIn('accept-write', self.calls)
 
     def test_independent_work_overlaps_and_each_delivery_goes_straight_to_qc(self):
         self.plan = [contract('a', 'Writer'), contract('b', 'Other Writer')]
@@ -208,8 +423,8 @@ class ContractTests(unittest.TestCase):
         self.plan[1].dependencies = ['a']
         self.assertTrue(self.runtime.validate_plan(type('Output', (), {'pydantic': Plan(contracts=self.plan)})())[0])
 
-    def test_unknown_dependencies_and_roles_are_rejected(self):
-        for item in (contract(role='Missing'), contract(dependencies=['future'])):
+    def test_unknown_dependencies_and_owners_are_rejected(self):
+        for item in (contract(owner='Missing'), contract(dependencies=['future'])):
             with self.subTest(item=item):
                 ok, _ = self.runtime.validate_plan(type('Output', (), {'pydantic': Plan(contracts=[item])})())
                 self.assertFalse(ok)
@@ -242,11 +457,11 @@ class ContractTests(unittest.TestCase):
 
                 def script(task):
                     if task.name == 'plan':
-                        return Plan(contracts=[contract(role=worker)])
+                        return Plan(contracts=[contract(owner=worker)])
                     if task.name.startswith('work-'):
                         return Delivery(output='Controlled example delivery.', files=[])
                     if task.name.startswith('qc-'):
-                        return QCResult(status='PASS', findings='Controlled acceptance check.')
+                        return qc_report(runtime.contracts['write'], findings='Controlled acceptance check.')
                     if task.name.startswith('accept-'):
                         return Acceptance(accepted=['write'])
                     return Completion(complete=True, summary='Controlled example lifecycle completed.')
