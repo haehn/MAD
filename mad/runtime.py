@@ -220,8 +220,7 @@ class Runtime:
                     errors.append(f'Missing evidence: {check.criterion_id}. Describe the observation or why verification could not be performed.')
                 if criterion is None:
                     continue
-                if check.verification != criterion.verification:
-                    errors.append(f'Wrong verification type: {check.criterion_id}')
+                check.verification = criterion.verification
                 if check.status == 'PASS' and criterion.verification == 'execution' and (
                         not check.executions or any(number not in current_runs for number in check.executions)):
                     errors.append(f'Execution criterion needs successful recorded QC execution evidence from this review: {check.criterion_id}. Run the check or report FAIL with the verification limitation.')
@@ -240,12 +239,12 @@ class Runtime:
                         'when the criteria concern observable behavior. Do not fix deliverables. '
                         'Untested required behavior means FAIL, not PASS. Finish once a verdict is supported; '
                         'do not repeat unchanged checks. Inline deliveries need no file checks. '
-                        'Report each criterion_id exactly once and preserve its verification type; criterion text is resolved by MAD. '
+                        'Report each criterion_id exactly once; criterion text and verification type are resolved by MAD. '
                         'Include nonempty evidence describing the observation. Execution criteria must cite successful '
                         'execution numbers from your own checks during this review; worker and earlier-review runs do not count.\n'
                         + json.dumps(dict(contract=asdict(contract), delivery=delivery.model_dump(),
                                           file_errors=issues, executions=evidence), ensure_ascii=False),
-            expected_output='QC JSON with overall status, findings, and checks. Each check includes criterion_id, status, evidence, verification, and executions (recorded execution numbers for execution checks).',
+            expected_output='QC JSON with overall status, findings, and checks. Each check includes criterion_id, status, evidence, and executions (recorded execution numbers for execution checks).',
             output_pydantic=QCResult,
             tools=[self.python_tool(self.qc, contract)],
             guardrail=validate_review, guardrail_max_retries=2,

@@ -38,7 +38,7 @@ class CriterionResult(BaseModel):
     criterion: str = Field(default='', description='Criterion text; MAD resolves it from criterion_id.')
     status: Literal['PASS', 'FAIL']
     evidence: str = ''
-    verification: Literal['inspection', 'execution']
+    verification: Literal['inspection', 'execution'] | None = Field(default=None, description='Resolved by MAD from criterion_id; may be omitted.')
     executions: list[StrictInt] = Field(default_factory=list, description='Numbered executions from this QC review; optional for inspection.')
 
 

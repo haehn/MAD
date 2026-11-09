@@ -251,6 +251,29 @@ class ContractTests(unittest.TestCase):
                          [(c.id, c.criterion) for c in reversed(self.plan[0].acceptance)])
         self.assertEqual(self.calls.count('qc-write'), 1)
 
+    def test_qc_derives_verification_from_contract_with_omitted_or_wrong_type(self):
+        self.plan[0].acceptance.append(Criterion('A2', 'The calculation succeeds.', 'execution'))
+        original = self.respond
+
+        def script(task):
+            if task.name == 'qc-write':
+                run = json.loads(task.tools[0].run(code='assert 2 + 2 == 4; print(4)'))
+                return QCResult(status='PASS', findings='Both criteria checked.', checks=[
+                    CriterionResult(criterion_id='A1', status='PASS', evidence='Read the inline result.',
+                                    verification='execution'),
+                    CriterionResult(criterion_id='A2', status='PASS', evidence='Calculation assertion passed.',
+                                    executions=[run['execution']]),
+                ])
+            return original(task)
+
+        self.callback = script
+        self.run_project()
+        checks = self.runtime.reports['write'].checks
+        self.assertEqual([c.verification for c in checks], ['inspection', 'execution'])
+        events = [json.loads(line) for line in self.runtime.log.read_text().splitlines()]
+        report = next(e for e in events if e['event'] == 'quality_control')
+        self.assertEqual([c['verification'] for c in report['checks']], ['inspection', 'execution'])
+
     def test_qc_cannot_replace_missing_criterion_with_duplicate_id(self):
         self.plan[0].acceptance.append(Criterion('A2', 'Another required property.', 'inspection'))
         original = self.respond
@@ -305,7 +328,7 @@ class ContractTests(unittest.TestCase):
     def test_execution_cannot_use_missing_worker_failed_or_stale_records(self):
         self.plan[0].acceptance = [Criterion('A1', 'Required behavior works.', 'execution')]
         original = self.respond
-        for mode in ('missing', 'worker', 'failed', 'stale', 'wrong_type'):
+        for mode in ('missing', 'worker', 'failed', 'stale', 'downgrade'):
             with self.subTest(mode=mode):
                 self.calls.clear()
                 self.runtime.executions.clear()
@@ -317,14 +340,14 @@ class ContractTests(unittest.TestCase):
                         previous = json.loads(task.tools[0].run(code='print("worker check")'))['execution']
                     if task.name == 'qc-write':
                         report = qc_report(self.runtime.contracts['write'])
-                        if mode in ('failed', 'wrong_type') or (mode == 'stale' and previous is None):
+                        if mode == 'failed' or (mode == 'stale' and previous is None):
                             code = 'raise RuntimeError("failed check")' if mode == 'failed' else 'print("checked")'
                             previous = json.loads(task.tools[0].run(code=code))['execution']
                             if mode == 'stale':
                                 report.status = 'FAIL'
                         if previous is not None:
                             report.checks[0].executions = [previous]
-                        if mode == 'wrong_type':
+                        if mode == 'downgrade':
                             report.checks[0].verification = 'inspection'
                         return report
                     return original(task)
