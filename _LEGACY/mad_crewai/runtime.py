@@ -77,8 +77,8 @@ class Runtime:
                 raise ValueError(f'The plan must provide root output {path}.')
 
     def parse_plan(self, value):
-        if not isinstance(value, dict) or set(value) != {'contracts', 'reason'} or not isinstance(value['contracts'], list) or not value['contracts']:
-            raise ValueError('Planning requires contracts (a nonempty list) and reason.')
+        if not isinstance(value, dict) or not {'contracts'} <= set(value) <= {'contracts', 'reason'} or not isinstance(value['contracts'], list) or not value['contracts']:
+            raise ValueError('Planning requires contracts (a nonempty list); reason is optional.')
         contracts = [self.normalize(Contract.parse(item)) for item in value['contracts']]
         result = {c.id: c for c in contracts}
         if len(result) != len(contracts):
@@ -104,7 +104,8 @@ class Runtime:
     def ask(self, agent, contract, phase, event, expected, validate):
         shared = (Path(__file__).parent / ('supervisor.md' if phase == 'supervisor' else 'worker.md')).read_text()
         brief = shared + '\nAssignment:\n' + json.dumps(event, ensure_ascii=False)
-        tools = self.workspace.tools(agent, contract, phase)
+        tools = [] if event.get('event') == 'plan' else self.workspace.tools(
+            agent, contract, phase, activity=lambda name: self.status(contract, phase, name, agent))
         for attempt in range(3):
             self.workspace.record('model_request', agent=agent.name, role=agent.role,
                                   contract=contract.id, revision=contract.revision, phase=phase, brief=brief)

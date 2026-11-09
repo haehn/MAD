@@ -1,9 +1,11 @@
 """Colorful console output; no agent or task decisions live here."""
+import sys
+
 from rich.console import Console
 from rich.text import Text
 
 
-console = Console()
+console = Console(file=sys.stdout)
 MAD_ART = r"""
 ███╗   ███╗ █████╗ ██████╗
 ████╗ ████║██╔══██╗██╔══██╗
@@ -25,8 +27,10 @@ def start(task, workspace, agents, log_path=None):
     console.print(task, markup=False, highlight=False)
     console.print('\nAgents', style='bold cyan')
     for index, agent in enumerate(agents):
-        console.print(Text.assemble((f'  ● {agent.name}', COLORS[(index + 3) % len(COLORS)]),
-                                   (f' → {agent.intelligence.model}', 'dim')))
+        name = agent.role
+        model = agent.llm.model
+        console.print(Text.assemble((f'  ● {name}', COLORS[(index + 3) % len(COLORS)]),
+                                   (f' → {model}', 'dim')))
     console.print(Text(f'\nWorkspace: {workspace}', style='dim'))
     if log_path is not None:
         console.print(Text(f'Log: {log_path}', style='dim'))
@@ -118,3 +122,8 @@ def log_entry(entry):
                    if key not in {'time', 'run_id', 'event', 'agent'} and value is not None]
         body = code_block('\n'.join(details)) if details else ''
     return f'## {timestamp} — {title}\n\n{body.rstrip()}\n\n'
+
+
+def contract(agent, contract_id, state):
+    color = 'red' if state == 'FAIL' else 'green' if state in {'PASS', 'ACCEPTED'} else 'cyan'
+    console.print(Text(f'◆ {agent} · {contract_id} · {state}', style=color))

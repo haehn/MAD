@@ -18,7 +18,7 @@ MAD means **Multi Agent Driver**: agents with roles communicate and perform work
 
 Put roles, responsibilities, planning and review guidance, judgment, and domain knowledge in Markdown. Shared agent guidance lives in `mad/instructions.md`; role templates live in `mad_agents/`.
 
-Keep Python focused on mechanics: project parsing, async actors, messaging, model calls, action execution, and audit storage.
+Keep Python focused on project parsing, contract state and validation, generic tools, CrewAI task assembly, and audit storage.
 
 For example, reviewing actual results belongs in `Supervisor.md`; enforcing that only the Supervisor can finish the project belongs in Python.
 
@@ -26,30 +26,28 @@ Before adding Python complexity, ask whether the behavior belongs in an existing
 
 ## Current structure
 
-- `mad/agents.py`: `Agent`, `Intelligence`, `Message`, and `Bus`; generic containers, model calls, and inbox transport.
-- `mad/runtime.py`: project parsing, persistent async agent loops, action dispatch, CLI options, and audit records.
-- `mad/ui.py`: console presentation and readable Markdown log formatting.
-- `mad/instructions.md`: shared instructions loaded for every agent at startup.
-- `mad_agents/`: Markdown role templates and `CONTRACT.md`, the INPUT/TASK/OUTPUT template loaded for Supervisor.
-- `mad_skills/`: retained Markdown reference material; the runtime does not automatically load skills.
-- `mad_server/`: model-serving launch scripts with a separate environment.
+- `mad/contracts.py`: plain Contract data and Pydantic Plan, Delivery, QC, acceptance, and completion models.
+- `mad/runtime.py`: existing project parsing, `Runtime`, direct CrewAI Agent/Task/Crew assembly, generic execution, and audit records.
+- `mad/ui.py`: colored console presentation and readable Markdown log formatting.
+- `mad/instructions.md`: shared guidance loaded for every configured agent.
+- `mad_agents/`: role templates and the contract guide loaded for Supervisor.
+- `mad_skills/`: retained reference material; skills are not automatically loaded.
+- `mad_server/`: model-serving scripts with a separate environment.
 - `go_mad.py`: command-line entry point.
-- `tests/`: regression tests for the current implementation.
-
-Keep this layout small. Do not restore the old task graph, ProjectState, separate workspace tools, or protocol layers without a demonstrated need.
+- `tests/`: project parsing, UI, and native CrewAI lifecycle tests.
+- `_LEGACY/`: reference implementations; do not restore their infrastructure.
 
 ## Preserve the coordination model
 
-- `Agent` contains only its name, intelligence link, and messaging link.
-- Each agent runs as a persistent async actor with its own inbox and conversation. Different agents can work in parallel and consume messages between model calls.
-- The first agent is the Supervisor. Only its system prompt receives the full project objective; workers receive their own role and the specific brief and input paths sent by Supervisor. Supervisor coordinates through ordinary messages and is the only agent allowed to finish the project.
-- Workers message only the Supervisor; the runtime enforces this routing rule. The Supervisor relays information and decides whether to dispatch independent work in parallel or await prerequisite deliveries. There is no Python task graph or task acceptance state machine.
-- Agents send messages, execute Python, wait for messages, or finish through the existing JSON action protocol. Sending a message ends the turn and waits for new input by default; `"wait": false` explicitly continues the turn for more messages or independent work.
-- Python execution uses the local environment and workspace as its working directory; it is not a filesystem sandbox.
-- Supervisor issues saved contracts through the message `contract` field. INPUT lists existing paths, TASK defines work and constraints, OUTPUT lists artifacts without acceptance or verification criteria. Runtime validates and loads each contract into the worker turn; workers need one before executing Python. Supervisor accepts or rejects results and sends an updated contract for corrections.
-- Handoffs use saved workspace files referenced by the message `files` field, including designs and review reports. The runtime validates references; recipients read files through Python. Questions and status messages can remain plain text.
-- Keep `.mad/audit` separate from deliverables. Store complete JSONL events and human-readable Markdown logs.
-- Preserve the project Markdown format and role template loading. Bare agent names and direct Python configuration are also supported.
+- The project Markdown defines the objective and available roles. The first role is Supervisor. Preserve role templates, model suffixes, bare names, and direct Python configuration.
+- Supervisor divides the project into Contracts: role, input, task, output, acceptance criteria, and dependencies. Supervisor owns acceptance and the final project decision.
+- Workers execute native CrewAI Tasks and return Deliveries. Output paths name files; an empty output list means the substantive result is delivered inline.
+- Every Delivery goes immediately to a separate QC agent through the worker Task's guardrail. QC returns PASS or FAIL with findings. FAIL returns the contract to the worker through CrewAI's correction retries.
+- Contract states are OPEN → DELIVERED → QC → ACCEPTED; QC failure returns to OPEN. Supervisor accepts QC-passed contracts before dependents start.
+- Use native async Tasks for independent work, native context for dependencies, and synchronous Supervisor checkpoints to join parallel tasks. Do not recreate schedulers, actor queues, message buses, registries, or persistence layers.
+- Keep role judgment and verification guidance in Markdown. Python enforces declared file paths, state, and authority. Agent claims do not prove observable behavior was tested.
+- Generic Python tools use the workspace as their working directory and are not a filesystem sandbox.
+- Keep `.mad/audit` separate from deliverables. Preserve readable Markdown, full JSONL records, actual execution results, and detailed CrewAI diagnostics.
 
 ## Keep MAD generic
 

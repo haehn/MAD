@@ -16,7 +16,7 @@ The project Markdown declares PROJECT, WORKSPACE, INTELLIGENCE, AGENTS, INPUT, O
 
 INTELLIGENCE supplies default `server` and `model`. Each AGENTS entry has `name` and a `role` Markdown path, and may override `server` and `model`. This supports a larger Supervisor, smaller role-specific workers, and a separate QA model. `--server` and `--model` override shared defaults while preserving explicit agent overrides. `--workspace` overrides the workspace. `MAD_API_KEY` supplies a server key when required.
 
-The human project is the root contract. The Supervisor plans flat delegated contracts with SETTING, INPUT, TASK, OUTPUT, ACCEPTANCE, OWNER, QA, and DEPENDS_ON. Python validates and saves them before work starts. Accepted prerequisite file paths and inline values are inserted into dependent contracts. Independent owners run concurrently; each agent has at most one active assignment, including QA.
+The human project is the root contract. Planning is tool-free: the Supervisor returns contracts before inspecting future deliverables. The Supervisor plans flat delegated contracts with SETTING, INPUT, TASK, OUTPUT, ACCEPTANCE, OWNER, QA, and DEPENDS_ON. Python validates and saves them before work starts. Accepted prerequisite file paths and inline values are inserted into dependent contracts. Independent owners run concurrently; each agent has at most one active assignment, including QA.
 
 Every delivery goes to its separately assigned QA agent, then to Supervisor review. QA must cover every acceptance condition and cite its own recorded observations. Failed or unverified checks prevent acceptance. Corrections create revised contracts and repeat QA. Accepted work unlocks dependencies. Root QA checks the integrated project after all delegated contracts are accepted. Root failures can spawn corrective contracts followed by another root QA pass. The default limit is three revisions per contract; the Supervisor can stop honestly.
 
@@ -40,3 +40,5 @@ Tests:
 python -m unittest discover -v
 /tmp/mad-crewai-env/bin/python -m unittest discover -v
 ```
+
+Model requests time out after 120 seconds without hidden client or CrewAI retries. Invalid structured responses get up to three audited correction attempts. Tool activity appears in the console; failed reads are recorded in the event audit.

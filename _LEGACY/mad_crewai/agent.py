@@ -16,11 +16,11 @@ class Agent:
         self.server = server
         self.intelligence = LLM(model=model, custom_openai=True, base_url=server,
                                 api_key=os.environ.get('MAD_API_KEY', 'local'),
-                                temperature=0.2, max_tokens=4096, timeout=120)
+                                temperature=0.2, max_tokens=4096, timeout=120, max_retries=0)
         self.crewai = CrewAIAgent(
             role=f'{name} ({self.role})', goal='Perform your assigned role within the supplied contract.',
             backstory=self.instructions, llm=self.intelligence, allow_delegation=False,
-            max_iter=30, max_retry_limit=2, verbose=True)
+            max_iter=30, max_retry_limit=0, verbose=True)
 
     def run(self, brief, expected, tools=(), progress=None):
         from crewai import Crew, Process, Task
@@ -28,6 +28,7 @@ class Agent:
         # A fresh executor gets only this assignment, not earlier contract conversations.
         agent = self.crewai.copy()
         agent.tools = list(tools)
+        agent.llm.response_format = {'type': 'json_object'} if not tools else None
         agent.step_callback = progress
         task = Task(description=brief, expected_output=expected, agent=agent)
         crew = Crew(agents=[agent], tasks=[task], process=Process.sequential,

@@ -102,15 +102,29 @@ class Workspace:
                 result['truncated'] = True
         return result
 
-    def tools(self, agent, contract, phase):
+    def tools(self, agent, contract, phase, activity=None):
         from crewai.tools import tool
+
+        def started(name, **arguments):
+            self.record('tool_started', agent=agent.name, role=agent.role, contract=contract.id,
+                        revision=contract.revision, phase=phase, tool=name, arguments=arguments)
+            if activity:
+                activity(name)
 
         @tool('read_file')
         def read_file(path: str, offset: int = 0) -> str:
             """Read a relative workspace file with recorded evidence. Use offsets for long files."""
-            if type(offset) is not int or offset < 0:
-                raise ValueError('offset must be a nonnegative character position.')
-            content = self.file(path).read_text(encoding='utf-8')
+            started('read_file', path=path, offset=offset)
+            try:
+                if type(offset) is not int or offset < 0:
+                    raise ValueError('offset must be a nonnegative character position.')
+                content = self.file(path).read_text(encoding='utf-8')
+            except (ValueError, OSError) as error:
+                self.record('tool_failed', agent=agent.name, contract=contract.id, phase=phase,
+                            tool='read_file', path=path, error=str(error))
+                if activity:
+                    activity('read_file failed')
+                raise
             entry = self.observe('inspection', agent, contract, phase, path=path,
                                  offset=offset, content=content[offset:offset + 12000],
                                  total_characters=len(content), truncated=offset + 12000 < len(content))
@@ -119,6 +133,7 @@ class Workspace:
         @tool('workspace_python')
         def workspace_python(code: str) -> str:
             """Run Python in the workspace; returns evidence ID, stdout, stderr, and exit status. Not a filesystem sandbox."""
+            started('workspace_python')
             return json.dumps(self.execute(code, agent, contract, phase))
 
         for item in (read_file, workspace_python):

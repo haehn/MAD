@@ -154,6 +154,8 @@ class RuntimeTests(unittest.TestCase):
                 event, _ = json.JSONDecoder().raw_decode(brief.split('\nAssignment:\n', 1)[1])
                 with case.guard:
                     case.events.append((self.name, event.get('phase') or event.get('event'), event['contract']['ID'] if 'contract' in event else 'project', event.get('revision', 0)))
+                if event.get('event') == 'plan':
+                    case.assertEqual(tools, [], 'Planning must not inspect future deliverables.')
                 progress(SimpleNamespace(text='step'))
                 return json.dumps(case.callback(self, event))
 
@@ -217,6 +219,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('[Tester]', self.terminal.getvalue())
         self.assertIn('combined r1', self.terminal.getvalue())
         self.assertTrue((self.runtime.workspace.audit / 'crew-output.log').exists())
+
+    def test_planning_never_constructs_workspace_tools(self):
+        self.runtime.assemble()
+        with patch.object(self.runtime.workspace, 'tools', side_effect=AssertionError('Planning called tools')):
+            plan = self.runtime.ask(self.runtime.supervisor, self.root, 'supervisor',
+                                    {'event': 'plan', 'root': self.root.definition()},
+                                    'Return contracts and reason.', self.runtime.parse_plan)
+        self.assertEqual(set(plan), {'work'})
+        self.assertEqual(set(self.runtime.parse_plan({'contracts': self.plan})), {'work'})
 
     def test_one_assignment_per_agent_including_qa(self):
         self.plan = [definition('a', files=('a.txt',)), definition('b', files=('result.txt',))]
@@ -344,6 +355,55 @@ class CrewAITests(unittest.TestCase):
         self.assertEqual(agent.intelligence.base_url, 'http://localhost:8012/v1')
         self.assertFalse(agent.crewai.allow_delegation)
 
+    def test_failed_model_request_is_not_silently_retried(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+        from .agent import Agent
+
+        calls = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                calls.append(self.rfile.read(int(self.headers['Content-Length'])))
+                response = json.dumps({'error': {'message': 'server busy', 'type': 'server_error'}}).encode()
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                agent = Agent('Supervisor', Path(__file__).parent / 'roles/Supervisor.md',
+                              f'http://127.0.0.1:{server.server_port}/v1', 'fixture')
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(Exception):
+                        agent.run('Return a small plan.', 'JSON plan.')
+            finally:
+                server.shutdown()
+                thread.join()
+        self.assertEqual(len(calls), 1, 'A failed request must surface without nested hidden retries.')
+
+    def test_failed_read_is_visible_and_saved_in_structured_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            agent = SimpleNamespace(name='Supervisor', role='Supervisor')
+            contract = Contract.parse(definition('project', 'Supervisor', 'QA One'))
+            activities = []
+            tool = workspace.tools(agent, contract, 'supervisor', activity=activities.append)[0]
+            with self.assertRaisesRegex(ValueError, 'relative'):
+                tool.run(path='/home/d/Projects/MAD/crewai-solar/design.md')
+            self.assertEqual(activities, ['read_file', 'read_file failed'])
+            events = [json.loads(line) for line in (workspace.audit / 'events.jsonl').read_text().splitlines()]
+            self.assertEqual([entry['event'] for entry in events], ['tool_started', 'tool_failed'])
+            self.assertEqual(events[1]['path'], '/home/d/Projects/MAD/crewai-solar/design.md')
+            self.assertFalse(workspace.evidence)
+
     def test_full_crewai_work_qa_and_root_qa_with_native_tools(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import re
@@ -366,6 +426,10 @@ class CrewAITests(unittest.TestCase):
                 tool_outputs = [m['content'] for m in request['messages'] if m['role'] == 'tool']
                 finish = 'stop'
                 if event.get('event') == 'plan':
+                    if request.get('tools'):
+                        raise AssertionError('Planning request advertised workspace tools')
+                    if request.get('response_format') != {'type': 'json_object'}:
+                        raise AssertionError('Planning must request native JSON output')
                     content = json.dumps(dict(contracts=children, reason='One bounded assignment.'))
                 elif event.get('event') == 'review':
                     content = json.dumps(dict(decision='accept', reason='Actual independent QA passed.'))

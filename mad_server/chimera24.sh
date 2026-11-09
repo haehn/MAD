@@ -4,6 +4,7 @@ CUDA_VISIBLE_DEVICES=0 \
 vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
   --host 0.0.0.0 \
   --port 8024 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --language-model-only \
   --max-model-len 16834 \
   --max-num-seqs 1 \

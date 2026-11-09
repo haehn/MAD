@@ -1,47 +1,26 @@
 import argparse
-import asyncio
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import RLock
 import traceback
 
-from .agents import Agent, Bus, Intelligence, ResponseTooLong
+from .contracts import Acceptance, Completion, Contract, Delivery, Plan, QCResult
 from . import ui
 
 
-PROTOCOL = """
-Respond with one JSON object:
-{"to":"agent name","text":"instructions, question, or status"} sends a message and waits for new input.
-Supervisor first writes a contract file using Python, then adds "contract":"contracts/work.md" to send it to one worker.
-OUTPUT paths name future artifacts; do not put them in "files" before they exist.
-Contract contents are included in the worker's message. Workers execute only their current contract and ask Supervisor about problems.
-INPUT lists existing workspace paths (or is empty), TASK describes the work and constraints, OUTPUT lists artifact paths only.
-OUTPUT contains no acceptance or verification criteria. Supervisor decides acceptance and issues an updated contract for corrections.
-Add "files":["workspace-relative path"] to return artifacts or reference existing files.
-Save all deliveries, including designs and review findings, as workspace files before sending their paths.
-Recipients read the referenced files using Python; messages coordinate work, not replace file deliveries.
-Add "wait":false to a message only to send more messages or continue independent work before waiting.
-Workers may message only the Supervisor. The Supervisor may message any worker and relay information between workers.
-{"python":"Python source code"} executes Python in the workspace and returns its output.
-{"wait":true} waits for another message.
-{"done":"final summary and verification"} finishes the project.
-Use pathlib for files and subprocess for commands. Paths are relative to the workspace.
-The .mad folder contains infrastructure logs, not deliverables; do not read or modify it.
-Execute work rather than claiming it was done. Ask questions when needed and report actual results.
-"""
-
-
 def record(path, event, **data):
-    if path is None:
-        return
-    entry = {"time": datetime.now(timezone.utc).isoformat(), "run_id": path.stem, "event": event, **data}
-    with path.open("a", encoding="utf-8") as output:
-        output.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    entry = dict(time=datetime.now(timezone.utc).isoformat(), run_id=path.stem, event=event, **data)
+    with path.open('a', encoding='utf-8') as output:
+        output.write(json.dumps(entry, ensure_ascii=False) + '\n')
     readable = ui.log_entry(entry)
     if readable:
-        with path.with_suffix(".md").open("a", encoding="utf-8") as output:
+        with path.with_suffix('.md').open('a', encoding='utf-8') as output:
             output.write(readable)
 
 
@@ -109,216 +88,266 @@ def workspace_path(workspace, name):
     return path
 
 
-def read_contract(workspace, name):
-    path = workspace_path(workspace, name)
-    if not path.is_file():
-        raise ValueError(f"Contract file does not exist: {name}. Use Python to create its INPUT/TASK/OUTPUT sections before sending it.")
-    sections = {}
-    section = None
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        heading = line[2:].upper() if line.startswith("# ") else ""
-        if heading in {"INPUT", "TASK", "OUTPUT"}:
-            if heading in sections:
-                raise ValueError(f"Duplicate contract section: {heading}.")
-            section = heading
-            sections[section] = []
-        elif line:
-            if section is None:
-                raise ValueError("Contracts start with # INPUT, followed by # TASK and # OUTPUT.")
-            sections[section].append(raw)
-    if list(sections) != ["INPUT", "TASK", "OUTPUT"]:
-        raise ValueError("Contracts require # INPUT, # TASK, and # OUTPUT in that order.")
-    contract = {"path": path.relative_to(Path(workspace).resolve()).as_posix(),
-                "TASK": "\n".join(sections["TASK"]).strip()}
-    if not contract["TASK"]:
-        raise ValueError("Contract TASK must describe the work.")
-    for section in ("INPUT", "OUTPUT"):
-        contract[section] = []
-        for raw in sections[section]:
-            if not raw.strip().startswith("- "):
-                raise ValueError(f"Contract {section} must list paths as '- relative/path'.")
-            item = workspace_path(workspace, raw.strip()[2:].strip())
-            if section == "INPUT" and not item.exists():
-                raise ValueError(f"Contract input does not exist: {raw.strip()[2:]}.")
-            contract[section].append(item.relative_to(Path(workspace).resolve()).as_posix())
-    if not contract["OUTPUT"]:
-        raise ValueError("Contract OUTPUT must list at least one artifact path.")
-    return contract
+class Runtime:
+    def __init__(self, task, roles, workspace, server, model, models=None):
+        self.task, self.roles, self.server, self.model = task, dict(roles), server, model
+        self.models = models or {}
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.folder = Path(__file__).resolve().parent.parent
+        self.supervisor = next(iter(roles))
+        self.qc = next((name for name, role in roles.items() if name != self.supervisor
+                        and (name.casefold() in {'qc', 'tester', 'reviewer', 'validator', 'quality control'}
+                             or any(f'# {label}' in role for label in ('Tester', 'Reviewer', 'Validator', 'Quality Control')))), None)
+        if self.qc is None:
+            self.qc = 'Quality Control'
+            if self.qc in self.roles:
+                self.qc = 'Delivery QC'
+            self.roles[self.qc] = (self.folder / 'mad_agents/core/Reviewer.md').read_text()
+        directory = self.workspace / '.mad/audit'
+        directory.mkdir(parents=True, exist_ok=True)
+        self.log = directory / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ') + '.jsonl')
+        self.lock = RLock()
+        self.contracts, self.reports = {}, {}
+        self.executions = {}
 
+    def record(self, event, **data):
+        with self.lock:
+            record(self.log, event, **data)
 
-async def work(agent, instructions, workspace, supervisor, finished, log_path=None):
-    try:
-        conversation = [{"role": "system", "content": instructions}]
-        feedback = None
-        truncations = 0
-        current_contract = None
-        while True:
-            if feedback is None:
-                message = await agent.messaging.receive(agent.name)
-                record(log_path, "message_received", agent=agent.name, sender=message.sender, text=message.text)
-                if message.contract is not None:
-                    current_contract = message.contract
-                feedback = f"{message.sender}: {message.text}"
-            inbox = agent.messaging.inboxes[agent.name]
-            while not inbox.empty():
-                message = inbox.get_nowait()
-                record(log_path, "message_received", agent=agent.name, sender=message.sender, text=message.text)
-                if message.contract is not None:
-                    current_contract = message.contract
-                feedback += f"\n{message.sender}: {message.text}"
-            conversation.append({"role": "user", "content": feedback})
-            record(log_path, "model_request", agent=agent.name, model=agent.intelligence.model,
-                   server=agent.intelligence.server, messages=conversation)
-            ui.activity(agent.name)
+    def state(self, contract, state, agent):
+        contract.state = state
+        self.record('contract_state', agent=agent, contract=asdict(contract))
+        ui.contract(agent, contract.id, state)
+
+    def python_tool(self, name, contract):
+        from crewai.tools import tool
+
+        @tool('workspace_python')
+        def workspace_python(code: str) -> str:
+            """Run Python to inspect, create, or verify workspace files. Returns actual output and exit code; not a filesystem sandbox."""
+            ui.activity(name)
+            self.record('python_started', agent=name, contract=contract.id, code=code)
             try:
-                reply = await agent.intelligence.reply(conversation, json_mode=True)
-            except ResponseTooLong as error:
-                truncations += 1
-                record(log_path, "action_failed", agent=agent.name, error_type=type(error).__name__,
-                       error=str(error), traceback=traceback.format_exc())
-                if truncations >= 3:
-                    raise
-                feedback = ("Your response was truncated and was not executed. Return a shorter, complete JSON action. "
-                            "Split large work into smaller actions.")
-                ui.error(f"{agent.name}: response truncated; retrying with a shorter action ({truncations}/2).")
-                continue
-            truncations = 0
-            record(log_path, "model_response", agent=agent.name, text=reply)
-            conversation.append({"role": "assistant", "content": reply})
-            conversation[1:] = conversation[1:][-20:]
-            try:
-                action = json.loads(reply)
-                if not isinstance(action, dict):
-                    raise ValueError("Return one JSON object.")
-                if {"to", "text"} <= set(action) <= {"to", "text", "wait", "files", "contract"}:
-                    waiting = action.get("wait", True)
-                    if not isinstance(waiting, bool):
-                        raise ValueError("Message wait must be true or false.")
-                    if action["to"] == agent.name:
-                        raise ValueError("Do not message yourself.")
-                    if agent.name != supervisor and action["to"] != supervisor:
-                        raise ValueError(f"Send questions, findings, and reports to {supervisor}; workers cannot message each other.")
-                    text = action["text"]
-                    contract = None
-                    if "contract" in action:
-                        if agent.name != supervisor:
-                            raise ValueError("Only the Supervisor can issue or update a contract.")
-                        contract = read_contract(workspace, action["contract"])
-                        text += (f"\n\nContract: {contract['path']}\n\n# INPUT\n"
-                                 + "\n".join(f"- {name}" for name in contract["INPUT"])
-                                 + f"\n\n# TASK\n{contract['TASK']}\n\n# OUTPUT\n"
-                                 + "\n".join(f"- {name}" for name in contract["OUTPUT"]))
-                    files = []
-                    if "files" in action:
-                        if not isinstance(action["files"], list) or not action["files"]:
-                            raise ValueError("files must be a nonempty list of workspace-relative file paths.")
-                        for name in action["files"]:
-                            path = workspace_path(workspace, name)
-                            if not path.is_file() or path.stat().st_size == 0:
-                                raise ValueError(f"Handoff file is missing or empty: {name}. The files field is for existing files; omit future OUTPUT paths until the worker creates them.")
-                            files.append(path.relative_to(Path(workspace).resolve()).as_posix())
-                        text += "\n\nFiles:\n" + "\n".join(f"- {name}" for name in files)
-                    await agent.messaging.send(agent.name, action["to"], text, contract=contract)
-                    record(log_path, "message_sent", agent=agent.name, recipient=action["to"], text=text,
-                           files=files, contract=contract)
-                    ui.message(agent.name, action["to"], text)
-                    if waiting:
-                        record(log_path, "agent_waiting", agent=agent.name, reason="Message sent", recipient=action["to"])
-                        feedback = None
-                    else:
-                        feedback = "Message delivered. Continue your current turn."
-                elif set(action) == {"python"}:
-                    if agent.name != supervisor and current_contract is None:
-                        raise ValueError("No contract received. Ask the Supervisor for an INPUT/TASK/OUTPUT contract before executing work.")
-                    record(log_path, "python_started", agent=agent.name, code=action["python"])
-                    result = await asyncio.to_thread(
-                        subprocess.run, [sys.executable, "-c", action["python"]],
-                        cwd=workspace, capture_output=True, text=True, timeout=30,
-                    )
-                    record(log_path, "python_finished", agent=agent.name, returncode=result.returncode,
-                           stdout=result.stdout, stderr=result.stderr)
-                    ui.tool_result(agent.name, result.returncode, result.stdout, result.stderr)
-                    feedback = json.dumps({"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr})
-                elif action == {"wait": True}:
-                    record(log_path, "agent_waiting", agent=agent.name)
-                    feedback = None
-                elif set(action) == {"done"}:
-                    if agent.name != supervisor:
-                        raise ValueError("Report to the Supervisor; only the Supervisor can finish.")
-                    if not inbox.empty():
-                        record(log_path, "finish_deferred", agent=agent.name, reason="Unread messages")
-                        feedback = "New messages arrived. Consider them before finishing."
-                        continue
-                    record(log_path, "supervisor_finished", agent=agent.name, summary=action["done"])
-                    finished.set_result(action["done"])
-                    return
-                else:
-                    raise ValueError("Choose to/text, python, wait, or done.")
-            except (ValueError, TypeError, KeyError, OSError, subprocess.TimeoutExpired) as error:
-                record(log_path, "action_failed", agent=agent.name, error_type=type(error).__name__,
-                       error=str(error), reply=reply)
-                ui.error(f"{agent.name}: {error}")
-                feedback = f"Action failed: {error}"
-    except asyncio.CancelledError:
-        record(log_path, "agent_stopped", agent=agent.name, reason="Cancelled")
-        raise
-    except Exception as error:
-        response = getattr(error, "response", None)
-        record(log_path, "agent_failed", agent=agent.name, error_type=type(error).__name__,
-               error=str(error), response_body=response.text if response is not None else None,
-               traceback=traceback.format_exc())
-        raise
+                result = subprocess.run([sys.executable, '-u', '-c', code], cwd=self.workspace,
+                                        capture_output=True, text=True, timeout=30)
+                data = dict(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+            except subprocess.TimeoutExpired as error:
+                data = dict(returncode=-1, stdout=str(error.stdout or ''), stderr='Execution exceeded 30 seconds.')
+            with self.lock:
+                self.executions.setdefault(contract.id, []).append(dict(agent=name, code=code, **data))
+            self.record('python_finished', agent=name, contract=contract.id, **data)
+            ui.tool_result(name, data['returncode'], '', '')
+            return json.dumps({**data, 'stdout': data['stdout'][:12000], 'stderr': data['stderr'][:12000]})
+
+        workspace_python.cache_function = lambda arguments, result: False
+        return workspace_python
+
+    def validate_plan(self, output):
+        try:
+            plan = output.pydantic or Plan.model_validate_json(output.raw)
+            previous, ancestors, writers = set(), {}, {}
+            workers = set(self.roles) - {self.supervisor, self.qc}
+            for contract in plan.contracts:
+                if not contract.id or contract.id in previous or contract.role not in workers:
+                    raise ValueError('Contract IDs must be unique and roles must name configured workers.')
+                if not contract.task.strip() or not contract.acceptance or any(not c.strip() for c in contract.acceptance):
+                    raise ValueError('Each contract requires a task and explicit acceptance criteria.')
+                if len(set(contract.dependencies)) != len(contract.dependencies) or not set(contract.dependencies) <= previous:
+                    raise ValueError('List contracts after their prerequisites; dependencies must name earlier IDs.')
+                ancestors[contract.id] = set(contract.dependencies)
+                for parent in contract.dependencies:
+                    ancestors[contract.id].update(ancestors[parent])
+                normalized = [workspace_path(self.workspace, path).relative_to(self.workspace).as_posix()
+                              for path in contract.output]
+                if len(normalized) != len(set(normalized)):
+                    raise ValueError('Output file paths must be unique.')
+                contract.output = normalized
+                for path in contract.output:
+                    if path in writers and writers[path] not in ancestors[contract.id]:
+                        raise ValueError(f'{path} has overlapping writers; add an ordering dependency.')
+                    writers[path] = contract.id
+                previous.add(contract.id)
+            self.contracts = {c.id: c for c in plan.contracts}
+            for contract in plan.contracts:
+                self.state(contract, 'OPEN', self.supervisor)
+            return True, output
+        except (ValueError, TypeError) as error:
+            return False, str(error)
+
+    def review_delivery(self, contract, output):
+        from crewai import Task
+
+        delivery = output.pydantic or Delivery.model_validate_json(output.raw)
+        self.state(contract, 'DELIVERED', contract.role)
+        issues = []
+        try:
+            paths = [workspace_path(self.workspace, p).relative_to(self.workspace).as_posix() for p in delivery.files]
+            if set(paths) != set(contract.output) or len(paths) != len(set(paths)):
+                issues.append(f'Delivery.files must be exactly {contract.output!r}. For an empty list, put the actual result in Delivery.output and return files=[].')
+            for path in paths:
+                if not workspace_path(self.workspace, path).is_file():
+                    issues.append(f'Missing output file: {path}')
+        except ValueError as error:
+            issues.append(str(error))
+        self.state(contract, 'QC', self.qc)
+        ui.activity(self.qc)
+        evidence = self.executions.get(contract.id, [])
+        review = Task(
+            name=f'qc-{contract.id}', agent=self.agents[self.qc].copy(),
+            description='Review this Delivery against every acceptance criterion. Inspect actual files and run checks '
+                        'when the criteria concern observable behavior. Do not fix deliverables. '
+                        'Untested required behavior means FAIL, not PASS. Finish once a verdict is supported; '
+                        'do not repeat unchanged checks. Inline deliveries need no file checks. Return concise findings.\n'
+                        + json.dumps(dict(contract=asdict(contract), delivery=delivery.model_dump(),
+                                          file_errors=issues, executions=evidence), ensure_ascii=False),
+            expected_output='JSON with status (PASS or FAIL) and concise findings based on actual observations.',
+            output_pydantic=QCResult,
+            tools=[self.python_tool(self.qc, contract)],
+        )
+        result = review.execute_sync()
+        qc = result.pydantic or QCResult.model_validate_json(result.raw)
+        if issues:
+            qc = QCResult(status='FAIL', findings='; '.join(issues) + '\n' + qc.findings)
+        self.reports[contract.id] = qc
+        self.record('quality_control', agent=self.qc, contract=contract.id, delivery=delivery.model_dump(), **qc.model_dump())
+        ui.contract(self.qc, contract.id, qc.status)
+        if qc.status == 'FAIL':
+            self.state(contract, 'OPEN', contract.role)
+            return False, qc.findings
+        output.raw = json.dumps(dict(contract=contract.id, delivery=delivery.model_dump(), qc=qc.model_dump()))
+        return True, output
+
+    def delivery_guardrail(self, contract):
+        def review(output):
+            return self.review_delivery(contract, output)
+        return review
+
+    def accept(self, contracts, output):
+        result = output.pydantic or Acceptance.model_validate_json(output.raw)
+        expected = {c.id for c in contracts}
+        if set(result.accepted) != expected or len(result.accepted) != len(expected):
+            return False, 'Accept exactly these QC-passed contracts: ' + ', '.join(sorted(expected))
+        if any(c.state != 'QC' or self.reports[c.id].status != 'PASS' for c in contracts):
+            return False, 'Only QC-passed deliveries may be accepted.'
+        for contract in contracts:
+            self.state(contract, 'ACCEPTED', self.supervisor)
+        return True, output
+
+    def assemble(self):
+        from crewai import Agent, Crew, LLM, Process, Task
+
+        shared = (self.folder / 'mad/instructions.md').read_text()
+        self.agents = {}
+        for name, role in self.roles.items():
+            llm = LLM(model=self.models.get(name, self.model), custom_openai=True, base_url=self.server,
+                      api_key=os.environ.get('MAD_API_KEY', 'local'), temperature=0.2,
+                      max_tokens=4096, stream=True, timeout=120, max_retries=0)
+            self.agents[name] = Agent(role=name, goal='Fulfill your configured role and assigned contract.',
+                                      backstory=role + '\n' + shared, llm=llm,
+                                      allow_delegation=False, max_iter=6, max_retry_limit=0, verbose=False,
+                                      step_callback=lambda step, who=name: self.record(
+                                          'model_response', agent=who, text=getattr(step, 'text', str(step))))
+        supervisor = self.agents[self.supervisor]
+        ui.start(self.task, self.workspace, list(self.agents.values()), self.log.with_suffix('.md'))
+        plan_task = Task(
+            name='plan', agent=supervisor, description='Plan this project using the available worker roles. '
+            'Return a few compact, self-contained contracts in dependency order. QA and acceptance are automatic; '
+            'do not create separate QA contracts. Output lists file paths; use [] for an inline delivery. '
+            'Independent roles can work concurrently.\nContract guide:\n'
+            + (self.folder / 'mad_agents/CONTRACT.md').read_text()
+            + '\nProject:\n' + self.task + '\nWorker roles:\n'
+            + json.dumps({name: role for name, role in self.roles.items() if name not in (self.supervisor, self.qc)}),
+            expected_output='A compact contract plan, with no implementation or commentary.',
+            output_pydantic=Plan, guardrail=self.validate_plan, guardrail_max_retries=2)
+        self.record('planning', agent=self.supervisor)
+        ui.activity(self.supervisor)
+        Crew(agents=[supervisor], tasks=[plan_task], process=Process.sequential,
+             memory=False, cache=False, verbose=False, tracing=False, share_crew=False).kickoff()
+
+        tasks, work, pending = [], {}, []
+
+        def checkpoint():
+            # A native synchronous Task joins preceding async work before dependents start.
+            batch = list(pending)
+            tasks.append(Task(
+                name='accept-' + '-'.join(c.id for c in batch), agent=supervisor,
+                description='Review these deliveries and their QC reports. Mark every QC-passed contract accepted: '
+                            + ', '.join(c.id for c in batch),
+                expected_output='The accepted contract IDs.', output_pydantic=Acceptance,
+                context=[work[c.id] for c in batch], guardrail=lambda result: self.accept(batch, result),
+                guardrail_max_retries=2))
+            pending.clear()
+
+        for contract in self.contracts.values():
+            pending_ids = {c.id for c in pending}
+            if pending and (pending_ids.intersection(contract.dependencies) or any(c.role == contract.role for c in pending)):
+                checkpoint()
+            agent = self.agents[contract.role].copy()
+            task = Task(
+                name='work-' + contract.id, agent=agent, async_execution=True,
+                description='Execute only this contract. Read prerequisite deliveries from context. '
+                            'Return actual output and files; do not claim project completion.\n'
+                            + json.dumps(asdict(contract), ensure_ascii=False),
+                expected_output='A Delivery JSON object: output contains the actual result; files exactly matches the contract output paths. Use files=[] for inline results.',
+                output_pydantic=Delivery,
+                context=[work[name] for name in contract.dependencies],
+                tools=[self.python_tool(contract.role, contract)],
+                guardrail=self.delivery_guardrail(contract), guardrail_max_retries=2)
+            tasks.append(task)
+            work[contract.id] = task
+            pending.append(contract)
+        if pending:
+            checkpoint()
+
+        def finish(result):
+            completion = result.pydantic or Completion.model_validate_json(result.raw)
+            if completion.complete and any(c.state != 'ACCEPTED' for c in self.contracts.values()):
+                return False, 'The project cannot finish while a contract is unaccepted.'
+            return True, result
+
+        tasks.append(Task(
+            name='project-review', agent=supervisor,
+            description='Decide whether the entire project is complete based on the accepted deliveries and QC findings. '
+                        'Only you can finish the project. Report limitations honestly.\nProject:\n' + self.task,
+            expected_output='A completion decision and concise evidence-based summary.',
+            output_pydantic=Completion, context=list(work.values()), guardrail=finish))
+        # CrewAI launches async worker tasks and joins them at synchronous checkpoints.
+        return Crew(agents=[supervisor, *[t.agent for t in work.values()]], tasks=tasks,
+                    process=Process.sequential, memory=False, cache=False, verbose=False, tracing=False, share_crew=False)
+
+    def run(self):
+        os.environ.setdefault('OTEL_SDK_DISABLED', 'true')
+        os.environ.setdefault('CREWAI_TELEMETRY_DISABLED', 'true')
+        self.record('run_started', task=self.task, roles=self.roles, workspace=str(self.workspace), server=self.server,
+                    models={name: self.models.get(name, self.model) for name in self.roles})
+        try:
+            with self.log.with_suffix('.crew.log').open('w', encoding='utf-8') as details:
+                with redirect_stdout(details), redirect_stderr(details):
+                    # Build and execute the Supervisor plan before assembling the work Crew.
+                    crew = self.assemble()
+                    result = crew.kickoff()
+            completion = result.pydantic or Completion.model_validate_json(result.raw)
+            self.record('run_finished', summary=completion.summary, complete=completion.complete)
+            if not completion.complete:
+                raise RuntimeError('Supervisor did not accept the project: ' + completion.summary)
+            ui.finish(completion.summary)
+            return completion.summary
+        except BaseException as error:
+            self.record('run_failed', error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())
+            raise
 
 
-async def start(task, roles, workspace, server, model, models=None):
-    workspace = Path(workspace).expanduser().resolve()
-    workspace.mkdir(parents=True, exist_ok=True)
-    shared_instructions = Path(__file__).with_name("instructions.md").read_text(encoding="utf-8")
-    contract_template = (Path(__file__).resolve().parent.parent / "mad_agents/CONTRACT.md").read_text(encoding="utf-8")
-    messaging = Bus()
-    models = models or {}
-    agents = [Agent(name, Intelligence(server, models.get(name, model)), messaging) for name in roles]
-    supervisor = agents[0].name
-    finished = asyncio.get_running_loop().create_future()
-    log_dir = workspace / ".mad" / "audit"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + ".jsonl")
-    record(log_path, "run_started", task=task, roles=roles, workspace=str(workspace), server=server,
-           models={agent.name: agent.intelligence.model for agent in agents})
-    ui.start(task, workspace, agents, log_path=log_path.with_suffix(".md"))
-    try:
-        async with asyncio.timeout(240):
-            async with asyncio.TaskGroup() as group:
-                running = []
-                for agent in agents:
-                    messaging.register(agent.name)
-                    objective = f"Task: {task}\nContract template:\n{contract_template}\n" if agent.name == supervisor else ""
-                    instructions = (f"You are {agent.name}.\n{roles[agent.name]}\n" + objective
-                                    + f"Team: {', '.join(roles)}. Supervisor: {supervisor}.\n"
-                                    f"Only {supervisor} may finish, after reviewing workers' results.\n"
-                                    + shared_instructions + "\n" + PROTOCOL)
-                    running.append(group.create_task(work(agent, instructions, workspace, supervisor, finished, log_path)))
-                await messaging.send("user", supervisor, task)
-                record(log_path, "message_sent", agent="user", recipient=supervisor, text=task)
-                summary = await finished
-                for actor in running:
-                    actor.cancel()
-    except BaseException as error:
-        event = "run_cancelled" if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt)) else "run_failed"
-        record(log_path, event, error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())
-        raise
-    record(log_path, "run_finished", summary=summary)
-    ui.finish(summary)
-    return summary
+def start(task, roles, workspace, server, model, models=None):
+    return Runtime(task, roles, workspace, server, model, models).run()
 
 
 def run(task=None, roles=None, workspace=None):
-    parser = argparse.ArgumentParser(description="Agents collaborate on a task. The first role coordinates.")
-    parser.add_argument("project", nargs="?", help="Project Markdown file")
-    parser.add_argument("--server", default="http://localhost:8000/v1")
-    parser.add_argument("--model", help="Override the model for all agents")
-    parser.add_argument("--workspace", help="Override the project workspace")
+    parser = argparse.ArgumentParser(description='MAD contracts executed and reviewed through CrewAI.')
+    parser.add_argument('project', nargs='?', help='Project Markdown file')
+    parser.add_argument('--server', default='http://localhost:8000/v1')
+    parser.add_argument('--model', help='Override the model for all agents')
+    parser.add_argument('--workspace', help='Override the project workspace')
     args = parser.parse_args()
     models = {}
     if args.project:
@@ -327,11 +356,6 @@ def run(task=None, roles=None, workspace=None):
         except (OSError, ValueError) as error:
             parser.error(str(error))
     if not task or not roles or not (args.workspace or workspace):
-        parser.error("Provide a project Markdown file with a task, WORKSPACE, and AGENTS.")
-    model = args.model or "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
-    asyncio.run(start(task, roles, args.workspace or workspace, args.server, model,
-                      models={} if args.model else models))
-
-
-if __name__ == "__main__":
-    run()
+        parser.error('Provide a project Markdown file with a task, WORKSPACE, and AGENTS.')
+    start(task, roles, args.workspace or workspace, args.server,
+          args.model or 'Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8', models={} if args.model else models)
